@@ -13,6 +13,45 @@ from simplejustwatchapi import offers_for_countries, search as jw_search
 OMDB_API_KEY = os.environ.get("OMDB_API_KEY", "a97d6284")
 OMDB_BASE = "http://www.omdbapi.com/"
 
+# YouTube Data API v3 (server-side only). Read from the environment so the key
+# never sits in the repo; empty string disables the YouTube full-movie section.
+YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
+YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
+
+
+def _load_dotenv(path: str = ".env") -> None:
+    """Load KEY=VALUE pairs from a .env file into os.environ (no dependencies)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError:
+        pass
+
+
+_load_dotenv()
+
+
+def _secret(name: str) -> str:
+    """API key from env var first, then Streamlit secrets (local .env/secrets)."""
+    val = os.environ.get(name, "")
+    if val:
+        return val
+    try:
+        return str(st.secrets.get(name, "") or "")
+    except Exception:
+        return ""
+
+
+YOUTUBE_API_KEY = _secret("YOUTUBE_API_KEY")
+
 COUNTRY = "IN"
 LANGUAGE = "en"
 
@@ -294,6 +333,100 @@ def omdb_details(selected: dict) -> dict:
     if data.get("Response") != "True":
         return {}
     return data
+
+
+_YOUTUBE_ISO_RE = re.compile(r"P(?:(\d+)D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
+
+
+def _youtube_duration_minutes(iso: str) -> int:
+    """YouTube ISO 8601 duration ('PT1H54M39S') -> total minutes."""
+    m = _YOUTUBE_ISO_RE.match(iso or "")
+    if not m:
+        return 0
+    d, h, min_, s = (int(x) if x else 0 for x in m.groups())
+    return d * 1440 + h * 60 + min_ + (1 if s >= 30 else 0)
+
+
+_YOUTUBE_BAD_WORDS = (
+    "trailer", "teaser", "review", "explained", "recap", "reaction", "music video"
+)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def youtube_full_movie(title: str, year: str = "", media_type: str = "") -> list:
+    """Find YouTube uploads that are actually full movies / full episodes.
+
+    Searches YouTube "full movie" / "full episodes", then fetches every video's
+    duration in one batch call and keeps only entries long enough to be a real
+    film or episode (trailers, recaps, and explainers are far shorter and are
+    also title-filtered). Results are sorted longest-first.
+    """
+    if not YOUTUBE_API_KEY:
+        return []
+    keyword = "full movie" if media_type == "movie" else "full episodes"
+    query = f"{title} {year} {keyword}".strip()
+    params = {
+        "part": "snippet",
+        "q": query,
+        "type": "video",
+        "videoEmbeddable": "true",
+        "maxResults": 10,
+        "key": YOUTUBE_API_KEY,
+    }
+    try:
+        with httpx.Client(timeout=10) as client:
+            data = client.get(YOUTUBE_SEARCH_URL, params=params).json()
+            items = data.get("items", [])
+            ids = ",".join(
+                item["id"]["videoId"]
+                for item in items
+                if item.get("id", {}).get("videoId")
+            )
+            durations = {}
+            if ids:
+                videos = (
+                    client.get(
+                        YOUTUBE_VIDEOS_URL,
+                        params={"part": "contentDetails", "id": ids, "key": YOUTUBE_API_KEY},
+                    )
+                    .json()
+                    .get("items", [])
+                )
+                durations = {
+                    video["id"]: _youtube_duration_minutes(
+                        video.get("contentDetails", {}).get("duration", "")
+                    )
+                    for video in videos
+                }
+    except httpx.HTTPError:
+        return []
+
+    min_length = 90 if media_type == "movie" else 20
+    results = []
+    for item in items:
+        vid = item.get("id", {}).get("videoId", "")
+        snippet = item.get("snippet", {})
+        if not vid:
+            continue
+        if durations.get(vid, 0) < min_length:
+            continue
+        lower_title = (snippet.get("title") or "").lower()
+        if any(word in lower_title for word in _YOUTUBE_BAD_WORDS):
+            continue
+        thumb = snippet.get("thumbnails", {}).get("medium", {}).get("url", "") or ""
+        results.append(
+            {
+                "video_id": vid,
+                "title": snippet.get("title", ""),
+                "channel": snippet.get("channelTitle", ""),
+                "duration": durations[vid],
+                "thumbnail": thumb,
+                "link": f"https://www.youtube.com/watch?v={vid}",
+                "embed": f"https://www.youtube.com/embed/{vid}",
+            }
+        )
+    results.sort(key=lambda r: r["duration"], reverse=True)
+    return results
 
 
 _RATING_SOURCES = {
@@ -707,6 +840,10 @@ def _render_result_cards(items: list):
             st.session_state["selected"] = item
             st.session_state["providers"] = get_providers(item)
             st.session_state["details"] = omdb_details(item)
+            st.session_state["yt_results"] = youtube_full_movie(
+                item["title"], item.get("year") or "", item["media_type"]
+            )
+            st.session_state.pop("yt_play", None)
 
 
 def main():
@@ -733,6 +870,8 @@ def main():
         st.session_state.pop("selected", None)
         st.session_state.pop("providers", None)
         st.session_state.pop("details", None)
+        st.session_state.pop("yt_results", None)
+        st.session_state.pop("yt_play", None)
         if not results and not suggestions:
             st.info("No results found for that title. Try a different spelling.")
 
@@ -823,6 +962,35 @@ def main():
             _show_navigate(paid_links)
         else:
             st.info("No paid streaming platform offers this title in India right now.")
+
+        yt_results = st.session_state.get("yt_results") or []
+        if YOUTUBE_API_KEY:
+            st.divider()
+            st.subheader("Full Movie on YouTube")
+            if yt_results:
+                st.caption("Verified uploads only (full-length, title clean). Pick one and play.")
+                for r in yt_results:
+                    ycols = st.columns([1, 3, 1])
+                    with ycols[0]:
+                        if r.get("thumbnail"):
+                            st.image(r["thumbnail"], width=96)
+                    with ycols[1]:
+                        st.markdown(
+                            f"**{_escape(r['title'])}**  \n"
+                            f"{_escape(r['channel'])} · {r['duration']} min"
+                        )
+                    with ycols[2]:
+                        if st.button(
+                            "Play", key=f"yt-{r['video_id']}", use_container_width=True
+                        ):
+                            st.session_state["yt_play"] = r
+            else:
+                st.info("No verified full movie for this title on YouTube right now.")
+
+        yt_play = st.session_state.get("yt_play")
+        if yt_play:
+            st.video(_safe_url(yt_play["embed"]))
+            st.markdown(f"[Watch on YouTube]({_safe_url(yt_play['link'])})")
 
         st.divider()
         st.subheader("Watch for Free")

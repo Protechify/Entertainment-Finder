@@ -11,3 +11,5 @@ services:
         value: 3.12.5
       - key: OMDB_API_KEY
         sync: false
+      - key: YOUTUBE_API_KEY
+        sync: false
