@@ -1813,11 +1813,7 @@ def _render_result_cards(items: list):
                         _omdb_runtime_minutes(details) or 0,
                     )
                 else:
-                    season_num = season or 0
-                    st.session_state["yt_results"] = youtube_series_playlists(
-                        item["title"], item.get("year") or "", lang,
-                        _omdb_season_episode_count(details, season_num) or 0,
-                    )
+                    st.session_state.pop("yt_results", None)
 
 
 def main():
@@ -1962,7 +1958,7 @@ def main():
 
         yt_results = st.session_state.get("yt_results") or []
         is_series = selected.get("media_type") == "tv"
-        if YOUTUBE_API_KEY:
+        if YOUTUBE_API_KEY and not is_series:
             st.divider()
             yt_lang = st.session_state.get("yt_lang") or ""
             lang_name = next(
