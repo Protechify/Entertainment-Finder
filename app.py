@@ -268,10 +268,151 @@ def _fallback_poster(title: str, title_year: str = "") -> str:
     return ""
 
 
-def omdb_search(query: str) -> list:
-    """Search OMDb for movies and TV series."""
+_MEDIA_HINT_TYPES = {
+    "movie": ("movie", "film", "padam", "thiraipadam", "cinema", "cinemma"),
+    "tv": ("series", "serial", "tv", "show", "thodar", "dhodar"),
+}
+
+
+def _extract_media_hint(query: str) -> tuple:
+    """Strip a trailing media-type keyword ('movie'/'series'/...) from a query.
+
+    Returns (clean_query, hint) where hint is 'movie', 'tv', or ''. The
+    keyword must be the FINAL word of the query, so normal titles like
+    "The Last of Us" are never hijacked by the word "of"/"us".
+    """
+    words = query.split()
+    if not words:
+        return query, ""
+    last = re.sub(r"[^a-zA-Z]", "", words[-1]).lower()
+    hint = next(
+        (kind for kind, keys in _MEDIA_HINT_TYPES.items() if last in keys), ""
+    )
+    if not hint:
+        return query, ""
+    return " ".join(words[:-1]).strip(), hint
+
+
+# Spoken language hints ("in English", "Tamil dub", ...) -> (ISO code, keyword).
+_LANGUAGE_HINTS = {
+    "english": ("en", "english"),
+    "tamil": ("ta", "tamil"),
+    "hindi": ("hi", "hindi"),
+    "telugu": ("te", "telugu"),
+    "malayalam": ("ml", "malayalam"),
+    "kannada": ("kn", "kannada"),
+    "bengali": ("bn", "bengali"),
+    "japanese": ("ja", "japanese"),
+    "korean": ("ko", "korean"),
+    "chinese": ("zh", "chinese"),
+    "spanish": ("es", "spanish"),
+    "french": ("fr", "french"),
+    "german": ("de", "german"),
+    "portuguese": ("pt", "portuguese"),
+}
+_LANG_WORDS = sorted(_LANGUAGE_HINTS, key=len, reverse=True)
+_LANG_RE = re.compile(
+    r"\b(?:in|with|audio|dub|dubbed|output|subtitles|sub)\s+(" + "|".join(_LANG_WORDS) + r")\b"
+    r"|\b(" + "|".join(_LANG_WORDS) + r")\s*(?:audio|dub|dubbed|version|subtitles|sub)?\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_language_hint(query: str) -> tuple:
+    """Strip spoken-language hints ("in English", "Tamil") from a query.
+
+    Returns (clean_query, lang) where lang is the ISO 639-1 code of the first
+    language mentioned, or '' when the query does not name a language.
+    """
+    lang = ""
+    out = _LANG_RE.sub("", " " + query + " ")
+    cleaned = re.sub(r"\s{2,}", " ", out).strip()
+    for word in query.lower().split():
+        plain = "".join(ch for ch in word if ch.isalnum())
+        if plain in _LANGUAGE_HINTS:
+            lang = _LANGUAGE_HINTS[plain][0]
+            break
+    return cleaned, lang
+
+
+def _extract_hints(query: str) -> tuple:
+    """Strip both trailing media-type and spoken-language hints.
+
+    Returns (clean_query, media_hint, lang). "Zeke's Pad series in English"
+    becomes ("Zeke's Pad", "tv", "en"). Language words are stripped first so a
+    media-type word directly before them ("...series in English") still hits.
+    """
+    query, lang = _extract_language_hint(query)
+    query, media_hint = _extract_media_hint(query)
+    return query, media_hint, lang
+
+
+_LANG_BY_ISO = {iso: word for word, (iso, _m) in _LANGUAGE_HINTS.items()}
+
+# Words that claim a video's AUDIO track language ("Tamil Full Movie",
+# "Hindi Dubbed", "English audio"). "Sub"/"subtitles" are deliberately absent:
+# an English-subbed Japanese raw is still Japanese audio.
+_AUDIO_MARKERS = (
+    "dubbed", "dub", "audio", "version", "language", "full movie",
+    "full film", "full episodes", "full hd",
+)
+
+
+def _other_lang_audio(title: str, lang: str) -> bool:
+    """True when a title claims its AUDIO is in a language other than `lang`.
+
+    e.g. for lang='te', "Hindhi Dubbed", "Tamil Full Movie", "English Dub"
+    all trigger and the upload is treated as wrong-language.
+    """
+    if not lang or lang not in _LANG_BY_ISO:
+        return False
+    low = title.lower()
+    for word, (iso, _m) in _LANGUAGE_HINTS.items():
+        if iso == lang:
+            continue
+        if re.search(
+            rf"\b{re.escape(word)}\s*[- ]?\s*(?:{'|'.join(_AUDIO_MARKERS)})\b", low
+        ):
+            return True
+    return False
+
+
+def _normalize_audio_lang(value) -> str:
+    """Normalize an ISO audio-language value ('en-US' -> 'en', None -> '').
+
+    'zxx'/'mul'/'und' carry no usable language info and map to '' too.
+    """
+    if not value:
+        return ""
+    iso = value.split("-")[0].strip().lower()
+    if iso in ("zxx", "mul", "und"):
+        return ""
+    return iso
+
+
+def _confirm_lang(title: str, audio: str, lang: str) -> bool:
+    """True when an upload is confidently in the requested language.
+
+    Either the uploader declared it (audio == lang) or the title itself claims
+    it ("Telugu", "Telugu Dubbed", ...). The caller drops audio mismatches
+    first, so a declared audio language here always equals `lang`.
+    """
+    if audio and audio == lang:
+        return True
+    marker = _LANG_BY_ISO.get(lang, "")
+    return bool(marker and re.search(rf"\b{re.escape(marker)}\b", title.lower()))
+
+
+def omdb_search(query: str, media_hint: str = "") -> list:
+    """Search OMDb for movies and TV series (optionally a single type)."""
     results = []
-    for media_type, label in (("movie", "movie"), ("series", "tv")):
+    if media_hint == "movie":
+        types = (("movie", "movie"),)
+    elif media_hint == "tv":
+        types = (("series", "tv"),)
+    else:
+        types = (("movie", "movie"), ("series", "tv"))
+    for media_type, label in types:
         try:
             with httpx.Client(timeout=10) as client:
                 resp = client.get(
@@ -353,80 +494,333 @@ _YOUTUBE_BAD_WORDS = (
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def youtube_full_movie(title: str, year: str = "", media_type: str = "") -> list:
+def youtube_full_movie(title: str, year: str = "", media_type: str = "", lang: str = "") -> list:
     """Find YouTube uploads that are actually full movies / full episodes.
 
     Searches YouTube "full movie" / "full episodes", then fetches every video's
     duration in one batch call and keeps only entries long enough to be a real
     film or episode (trailers, recaps, and explainers are far shorter and are
-    also title-filtered). Results are sorted longest-first.
+    also title-filtered). Results are ranked by title+year match (top 3). A
+    language hint (e.g. 'ta') biases the search and boosts matching titles.
     """
     if not YOUTUBE_API_KEY:
         return []
+    marker = _LANGUAGE_HINTS.get(lang, (None, ""))[1]
     keyword = "full movie" if media_type == "movie" else "full episodes"
-    query = f"{title} {year} {keyword}".strip()
-    params = {
-        "part": "snippet",
-        "q": query,
-        "type": "video",
-        "videoEmbeddable": "true",
-        "maxResults": 10,
-        "key": YOUTUBE_API_KEY,
-    }
+    min_length = 90 if media_type == "movie" else 20
+
+    def _collect(query: str) -> list:
+        if not query.strip():
+            return []
+        params = {
+            "part": "snippet",
+            "q": query.strip(),
+            "type": "video",
+            "videoEmbeddable": "true",
+            "maxResults": 10,
+            "key": YOUTUBE_API_KEY,
+        }
+        if marker:
+            params["relevanceLanguage"] = lang
+        try:
+            with httpx.Client(timeout=10) as client:
+                data = client.get(YOUTUBE_SEARCH_URL, params=params).json()
+                items = data.get("items", [])
+                ids = ",".join(
+                    item["id"]["videoId"]
+                    for item in items
+                    if item.get("id", {}).get("videoId")
+                )
+                durations = {}
+                audio_langs = {}
+                if ids:
+                    videos = (
+                        client.get(
+                            YOUTUBE_VIDEOS_URL,
+                            params={"part": "snippet,contentDetails", "id": ids, "key": YOUTUBE_API_KEY},
+                        )
+                        .json()
+                        .get("items", [])
+                    )
+                    for video in videos:
+                        durations[video["id"]] = _youtube_duration_minutes(
+                            video.get("contentDetails", {}).get("duration", "")
+                        )
+                        audio_langs[video["id"]] = _normalize_audio_lang(
+                            (video.get("snippet", {}) or {}).get("defaultAudioLanguage")
+                        )
+        except httpx.HTTPError:
+            return []
+
+        picked = []
+        for item in items:
+            vid = item.get("id", {}).get("videoId", "")
+            snippet = item.get("snippet", {})
+            if not vid:
+                continue
+            if durations.get(vid, 0) < min_length:
+                continue
+            video_title = _html.unescape(snippet.get("title") or "")
+            channel = _html.unescape(snippet.get("channelTitle") or "")
+            if any(word in video_title.lower() for word in _YOUTUBE_BAD_WORDS):
+                continue
+            audio = audio_langs.get(vid, "")
+            if lang:
+                if audio and audio != lang:
+                    continue
+                if _other_lang_audio(video_title, lang):
+                    continue
+                if not _confirm_lang(video_title, audio, lang):
+                    continue
+            thumb = snippet.get("thumbnails", {}).get("medium", {}).get("url", "") or ""
+            picked.append(
+                {
+                    "video_id": vid,
+                    "title": video_title,
+                    "channel": channel,
+                    "duration": durations[vid],
+                    "audio_lang": audio,
+                    "thumbnail": thumb,
+                    "link": f"https://www.youtube.com/watch?v={vid}",
+                }
+            )
+        return picked
+
+    results = _collect(f"{title} {year} {keyword}")
+    if lang and not results:
+        results = _collect(f"{title} {year} {marker} {keyword}")
+
+    results.sort(
+        key=lambda r: (
+            _yt_relevance_score(r["title"], title, year)
+            + (60 if marker and marker in r["title"].lower() else 0),
+            r["duration"],
+        ),
+        reverse=True,
+    )
+    return results[:3]
+
+
+def _yt_relevance_score(result_title: str, title: str, year: str) -> int:
+    """Rank a YouTube result against the searched title+certain year.
+
+    Exact-title match is best, then substring/token hits, then the selected
+    release year appearing in the title (e.g. "(2015)") which keeps wrong-year
+    uploads of similarly-named movies below the right one.
+    """
+    rt = _normalize_title(result_title)
+    qt = _normalize_title(title)
+    score = 0
+    if qt and rt == qt:
+        return 1000
+    if qt and qt in rt:
+        score += 200
+    score += 5 * sum(1 for t in _significant_tokens(title) if t in rt)
+    if year and str(year) in rt:
+        score += 10
+    return score
+
+
+_YOUTUBE_PLAYLIST_BAD_WORDS = (
+    "trailer", "teaser", "best moments", "movie", "review", "explained",
+    "recap", "reaction", "music", "ending", "opening",
+)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def youtube_series_playlists(title: str, year: str = "", lang: str = "") -> list:
+    """Find full-series playlists on YouTube for a TV series.
+
+    Searches YouTube for playlists of the series' full episodes, fetches each
+    playlist's video count in one batch call, and keeps only entries big enough
+    to be a real season/box-set. Results are ranked by title+year match and
+    playlist size (top 3). If the year-scoped search finds nothing, a broader
+    search without the year is retried (playlist titles rarely carry the year).
+    A language hint additionally shows only playlists CONFIRMED to be in that
+    language (title claim or video audio check), trying a language-word query
+    when the plain search finds none.
+    """
+    if not YOUTUBE_API_KEY:
+        return []
+    marker = _LANGUAGE_HINTS.get(lang, (None, ""))[1]
+    need = _significant_tokens(title)
+
+    def _try_query(query: str) -> list:
+        params = {
+            "part": "snippet",
+            "q": query,
+            "type": "playlist",
+            "maxResults": 10,
+            "key": YOUTUBE_API_KEY,
+        }
+        if marker:
+            params["relevanceLanguage"] = lang
+        try:
+            with httpx.Client(timeout=10) as client:
+                data = client.get(YOUTUBE_SEARCH_URL, params=params).json()
+                items = data.get("items", [])
+                ids = ",".join(
+                    item["id"]["playlistId"]
+                    for item in items
+                    if item.get("id", {}).get("playlistId")
+                )
+                counts = {}
+                if ids:
+                    playlists = (
+                        client.get(
+                            "https://www.googleapis.com/youtube/v3/playlists",
+                            params={
+                                "part": "contentDetails",
+                                "id": ids,
+                                "key": YOUTUBE_API_KEY,
+                            },
+                        )
+                        .json()
+                        .get("items", [])
+                    )
+                    counts = {
+                        pl["id"]: int(pl.get("contentDetails", {}).get("itemCount", 0))
+                        for pl in playlists
+                    }
+        except httpx.HTTPError:
+            return []
+
+        results = []
+        for item in items:
+            pid = item.get("id", {}).get("playlistId", "")
+            snippet = item.get("snippet", {})
+            if not pid:
+                continue
+            playlist_title = _html.unescape(snippet.get("title") or "")
+            if counts.get(pid, 0) < 5:
+                continue
+            lower_title = playlist_title.lower()
+            if any(word in lower_title for word in _YOUTUBE_PLAYLIST_BAD_WORDS):
+                continue
+            rt = _normalize_title(playlist_title)
+            if not rt or not all(token in rt for token in need):
+                continue
+            if lang and _other_lang_audio(playlist_title, lang):
+                continue
+            thumb = snippet.get("thumbnails", {}).get("medium", {}).get("url", "") or ""
+            item_count = counts[pid]
+            score = (
+                _yt_relevance_score(playlist_title, title, year)
+                + min(item_count, 60)
+                + (60 if marker and marker in lower_title else 0)
+            )
+            results.append(
+                {
+                    "playlist_id": pid,
+                    "title": playlist_title,
+                    "channel": _html.unescape(snippet.get("channelTitle") or ""),
+                    "item_count": item_count,
+                    "thumbnail": thumb,
+                    "link": f"https://www.youtube.com/playlist?list={pid}",
+                    "_score": score,
+                }
+            )
+        results.sort(key=lambda r: r["_score"], reverse=True)
+        for r in results:
+            r.pop("_score", None)
+        return results
+
+    results = _try_query(f"{title} {year} full episodes".strip())
+    if not results and year:
+        results = _try_query(f"{title} full episodes".strip())
+
+    if lang:
+        def _pick(rs: list) -> list:
+            if not rs:
+                return []
+            votes = _verify_playlist_languages([r["playlist_id"] for r in rs])
+            kept = []
+            for r in rs:
+                v = votes.get(r["playlist_id"], set())
+                if r["title"].lower() and _other_lang_audio(r["title"], lang):
+                    continue
+                if lang in v or (marker and re.search(rf"\b{re.escape(marker)}\b", r["title"].lower())):
+                    r["audio_lang"] = _LANG_BY_ISO.get(lang, "") if lang in v else ""
+                    r["_score"] = (
+                        _yt_relevance_score(r["title"], title, year)
+                        + min(r["item_count"], 60)
+                        + (60 if marker and marker in r["title"].lower() else 0)
+                        + (30 if lang in v else 0)
+                    )
+                    kept.append(r)
+            return kept
+
+        kept = _pick(results)
+        if not kept:
+            extra = _try_query(f"{title} {year} {marker} full episodes".strip())
+            if not extra and year:
+                extra = _try_query(f"{title} {marker} full episodes".strip())
+            kept = _pick(extra)
+        kept.sort(key=lambda r: r["_score"], reverse=True)
+        for r in kept:
+            r.pop("_score", None)
+        return kept[:3]
+
+    return results[:3]
+
+
+def _verify_playlist_languages(playlist_ids: list) -> dict:
+    """Map playlistId -> set of audio languages among its first 5 videos.
+
+    Reads each playlist's first few videos via the playlistItems endpoint, then
+    a single batched videos call surfaces their uploader-declared
+    defaultAudioLanguage. Playlists whose videos declare only OTHER languages
+    are treated as wrong-language by the caller.
+    """
+    votes = {pid: set() for pid in playlist_ids}
+    if not playlist_ids:
+        return votes
     try:
         with httpx.Client(timeout=10) as client:
-            data = client.get(YOUTUBE_SEARCH_URL, params=params).json()
-            items = data.get("items", [])
-            ids = ",".join(
-                item["id"]["videoId"]
-                for item in items
-                if item.get("id", {}).get("videoId")
-            )
-            durations = {}
-            if ids:
-                videos = (
+            first_ids = []
+            for pid in playlist_ids:
+                items = (
                     client.get(
-                        YOUTUBE_VIDEOS_URL,
-                        params={"part": "contentDetails", "id": ids, "key": YOUTUBE_API_KEY},
+                        "https://www.googleapis.com/youtube/v3/playlistItems",
+                        params={
+                            "part": "snippet",
+                            "playlistId": pid,
+                            "maxResults": 5,
+                            "key": YOUTUBE_API_KEY,
+                        },
                     )
                     .json()
                     .get("items", [])
                 )
-                durations = {
-                    video["id"]: _youtube_duration_minutes(
-                        video.get("contentDetails", {}).get("duration", "")
-                    )
-                    for video in videos
-                }
-    except httpx.HTTPError:
-        return []
-
-    min_length = 90 if media_type == "movie" else 20
-    results = []
-    for item in items:
-        vid = item.get("id", {}).get("videoId", "")
-        snippet = item.get("snippet", {})
-        if not vid:
-            continue
-        if durations.get(vid, 0) < min_length:
-            continue
-        lower_title = (snippet.get("title") or "").lower()
-        if any(word in lower_title for word in _YOUTUBE_BAD_WORDS):
-            continue
-        thumb = snippet.get("thumbnails", {}).get("medium", {}).get("url", "") or ""
-        results.append(
-            {
-                "video_id": vid,
-                "title": snippet.get("title", ""),
-                "channel": snippet.get("channelTitle", ""),
-                "duration": durations[vid],
-                "thumbnail": thumb,
-                "link": f"https://www.youtube.com/watch?v={vid}",
-                "embed": f"https://www.youtube.com/embed/{vid}",
+                first_ids += [
+                    (pid, it["snippet"]["resourceId"]["videoId"])
+                    for it in items
+                    if it.get("snippet", {}).get("resourceId", {}).get("videoId")
+                ]
+            if not first_ids:
+                return votes
+            ids = ",".join(vid for _, vid in first_ids)
+            videos = (
+                client.get(
+                    "https://www.googleapis.com/youtube/v3/videos",
+                    params={"part": "snippet", "id": ids, "key": YOUTUBE_API_KEY},
+                )
+                .json()
+                .get("items", [])
+            )
+            lookup = {
+                v["id"]: _normalize_audio_lang(
+                    (v.get("snippet", {}) or {}).get("defaultAudioLanguage")
+                )
+                for v in videos
             }
-        )
-    results.sort(key=lambda r: r["duration"], reverse=True)
-    return results
+            for pid, vid in first_ids:
+                audio = lookup.get(vid, "")
+                if audio:
+                    votes[pid].add(audio)
+    except httpx.HTTPError:
+        pass
+    return votes
 
 
 _RATING_SOURCES = {
@@ -578,33 +972,68 @@ _MIN_SUGGEST_SCORE = 0.82
 _MIN_SUGGEST_TITLE_LEN = 6
 
 
+def _spelling_variants(query: str, cap: int = 5) -> list:
+    """Spelling variants fixing doubled-vowel typos (Tamil/Indian names).
+
+    "vanathaipola" -> ["vaanathaipola", "vanathaipolaa", ...]: for each vowel,
+    a double-vowel and a halve-double-vowel twist is produced (deduped, capped)
+    so OMDb/JustWatch fuzzy search can still find the intended title.
+    """
+    out: list = []
+    for i, ch in enumerate(query):
+        low = ch.lower()
+        if low in "aeiou":
+            out.append(query[:i] + ch + query[i:])
+        if low in "aaeeiioouu":
+            out.append(query[:i] + query[i + 1:])
+        if len(out) >= cap:
+            break
+    return list(dict.fromkeys(out))
+
+
+def _suggest_source(query: str, media_hint: str = "") -> list:
+    """Pooled OMDb + JustWatch candidates for a suggestion search query."""
+    return omdb_search(query, media_hint) + justwatch_search(
+        query, verify_poster=False, count=8
+    )
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def fuzzy_suggest(query: str, limit: int = 3) -> list:
     """Suggest likely-correct titles when the exact search misses (e.g. typos).
 
-    Searches JustWatch with relaxed/prefix queries in parallel, scores the
-    pooled titles against the original query, and returns the best matches.
-    Poster URLs are verified only for the final candidates to stay fast.
+    Searches OMDb and JustWatch with relaxed/prefix queries plus spelling
+    variants in parallel, scores every pooled title against the original query,
+    and returns the best matches. Poster URLs are verified only for the final
+    candidates to stay fast.
     """
+    query, media_hint, _ = _extract_hints(query)
     query = query.strip()
     if not query:
         return []
-    queries = _relaxed_queries(query)[1:]  # raw query already searched by search()
+    queries = list(dict.fromkeys(
+        [query]
+        + (_spelling_variants(query) if len(query) >= 6 else [])
+        + _relaxed_queries(query)[1:]
+    ))[1:]  # raw query already searched by search()
     pool = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(queries) or 1)) as ex:
         futures = [
-            ex.submit(justwatch_search, q, verify_poster=False, count=8)
+            ex.submit(_suggest_source, q, media_hint)
             for q in queries
         ]
         for fut in futures:
             try:
-                items = fut.result(timeout=20)
+                items = fut.result(timeout=25)
             except Exception:
                 continue
             for item in items:
                 key = _dedup_key(item)
-                if not any(_dedup_key(k) == key for k in pool):
-                    pool.append(item)
+                if any(_dedup_key(k) == key for k in pool):
+                    continue
+                if media_hint and item["media_type"] != media_hint:
+                    continue
+                pool.append(item)
     scored = [
         (score, item)
         for item in pool
@@ -622,12 +1051,15 @@ def fuzzy_suggest(query: str, limit: int = 3) -> list:
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def search(query: str) -> list:
+    query, media_hint, _ = _extract_hints(query)
     query = query.strip()
     if not query:
         return []
     results = [
-        item for item in (omdb_search(query) + justwatch_search(query))
-        if _title_contains_query(query, item["title"])
+        item
+        for item in (omdb_search(query, media_hint) + justwatch_search(query))
+        if (not media_hint or item["media_type"] == media_hint)
+        and _title_contains_query(query, item["title"])
     ]
     kept = []
     for item in results:
@@ -796,7 +1228,7 @@ def _navigate_chip(link: dict) -> str:
     )
 
 
-def _poster_placeholder(title: str, width: int = 72) -> str:
+def _poster_placeholder(title: str, width: int = 120) -> str:
     initial = _escape((title or "?")[0].upper() if title else "?")
     height = int(width * 1.5)
     return (
@@ -805,6 +1237,12 @@ def _poster_placeholder(title: str, width: int = 72) -> str:
         f'justify-content:center;color:#5a6472;font-weight:700;font-size:1.3rem;'
         f'font-family:inherit;">{initial}</div>'
     )
+
+
+@st.dialog("Larger view", width="large")
+def _show_large_media(url: str) -> None:
+    """Modal lightbox showing an image (poster/thumbnail) full-size."""
+    st.image(url, use_container_width=True)
 
 
 def _show_navigate(links: list, chunk: int = 2):
@@ -822,7 +1260,14 @@ def _render_result_cards(items: list):
         cols = st.columns([1, 3, 1])
         with cols[0]:
             if item.get("poster"):
-                st.image(item["poster"], width=72)
+                st.image(item["poster"], width=120)
+                if st.button(
+                    "⤢",
+                    key=f"zoom-{item['id']}",
+                    help="Show larger",
+                    use_container_width=True,
+                ):
+                    _show_large_media(item["poster"])
             else:
                 st.markdown(
                     _poster_placeholder(item["title"]), unsafe_allow_html=True
@@ -840,10 +1285,15 @@ def _render_result_cards(items: list):
             st.session_state["selected"] = item
             st.session_state["providers"] = get_providers(item)
             st.session_state["details"] = omdb_details(item)
-            st.session_state["yt_results"] = youtube_full_movie(
-                item["title"], item.get("year") or "", item["media_type"]
-            )
-            st.session_state.pop("yt_play", None)
+            lang = st.session_state.get("yt_lang") or ""
+            if item["media_type"] == "tv":
+                st.session_state["yt_results"] = youtube_series_playlists(
+                    item["title"], item.get("year") or "", lang
+                )
+            else:
+                st.session_state["yt_results"] = youtube_full_movie(
+                    item["title"], item.get("year") or "", item["media_type"], lang
+                )
 
 
 def main():
@@ -851,7 +1301,8 @@ def main():
 
     st.title("Entertainment Finder")
     st.caption(
-        "Search any movie, TV series, or anime and find out where it's streaming in India."
+        "Search any movie, TV series, or anime and find out where it's streaming in India. "
+        "Add a language to prioritize it on YouTube (e.g. \"One Piece (Mention Movie or Series after movie name) in Japanese\")."
     )
 
     with st.form("search_form"):
@@ -863,21 +1314,33 @@ def main():
         submitted = st.form_submit_button("Search", type="primary", use_container_width=True)
 
     if submitted:
+        _, hint_label, lang = _extract_hints(query)
         results = search(query)
         suggestions = fuzzy_suggest(query) if not results else []
         st.session_state["results"] = results
         st.session_state["suggestions"] = suggestions
+        st.session_state["hint_label"] = hint_label
+        st.session_state["yt_lang"] = lang
         st.session_state.pop("selected", None)
         st.session_state.pop("providers", None)
         st.session_state.pop("details", None)
         st.session_state.pop("yt_results", None)
-        st.session_state.pop("yt_play", None)
         if not results and not suggestions:
-            st.info("No results found for that title. Try a different spelling.")
+            if hint_label:
+                type_name = "Movie" if hint_label == "movie" else "TV series"
+                st.info(
+                    f"No {type_name} results found for that title. Try a different spelling."
+                )
+            else:
+                st.info("No results found for that title. Try a different spelling.")
 
     results = st.session_state.get("results", [])
     if results:
         st.subheader("Results")
+        hint_label = st.session_state.get("hint_label")
+        if hint_label:
+            type_name = "Movie" if hint_label == "movie" else "TV series"
+            st.caption(f"Showing {type_name} results only")
         _render_result_cards(results)
 
     suggestions = st.session_state.get("suggestions", [])
@@ -893,6 +1356,13 @@ def main():
         with left:
             if selected.get("poster"):
                 st.image(selected["poster"], width=180)
+                if st.button(
+                    "⤢",
+                    key="zoom-detail",
+                    help="Show larger",
+                    use_container_width=False,
+                ):
+                    _show_large_media(selected["poster"])
         with right:
             badge = _chip(
                 "Movie" if selected["media_type"] == "movie" else "TV",
@@ -966,31 +1436,85 @@ def main():
         yt_results = st.session_state.get("yt_results") or []
         if YOUTUBE_API_KEY:
             st.divider()
-            st.subheader("Full Movie on YouTube")
-            if yt_results:
-                st.caption("Verified uploads only (full-length, title clean). Pick one and play.")
-                for r in yt_results:
-                    ycols = st.columns([1, 3, 1])
-                    with ycols[0]:
-                        if r.get("thumbnail"):
-                            st.image(r["thumbnail"], width=96)
-                    with ycols[1]:
-                        st.markdown(
-                            f"**{_escape(r['title'])}**  \n"
-                            f"{_escape(r['channel'])} · {r['duration']} min"
-                        )
-                    with ycols[2]:
-                        if st.button(
-                            "Play", key=f"yt-{r['video_id']}", use_container_width=True
-                        ):
-                            st.session_state["yt_play"] = r
+            is_series = selected.get("media_type") == "tv"
+            yt_lang = st.session_state.get("yt_lang") or ""
+            lang_name = next(
+                (k for k, (iso, m) in _LANGUAGE_HINTS.items() if iso == yt_lang), ""
+            )
+            lang_note = f" · {lang_name.title()} prioritized" if lang_name else ""
+            if is_series:
+                st.subheader("Full Series on YouTube")
+                if yt_results:
+                    st.caption(f"Full-episode playlists (verified by size). Pick one and play.{lang_note}")
+                    for r in yt_results:
+                        ycols = st.columns([1, 3, 1])
+                        with ycols[0]:
+                            if r.get("thumbnail"):
+                                st.image(r["thumbnail"], width=120)
+                                if st.button(
+                                    "⤢",
+                                    key=f"ytzoom-{r.get('playlist_id') or r['video_id']}",
+                                    help="Show larger",
+                                    use_container_width=True,
+                                ):
+                                    _show_large_media(r["thumbnail"])
+                        with ycols[1]:
+                            al = r.get("audio_lang") or ""
+                            audio_chip = f" · {_escape(al)} audio" if al else ""
+                            st.markdown(
+                                f"**{_escape(r['title'])}**  \n"
+                                f"{_escape(r['channel'])} · {r.get('item_count')} episodes{audio_chip}"
+                            )
+                        with ycols[2]:
+                            st.link_button(
+                                "Play",
+                                _safe_url(r["link"]),
+                                use_container_width=True,
+                                type="primary",
+                            )
+                else:
+                    st.info(
+                        f"No {lang_name.title()} full-series playlist for this title on YouTube right now."
+                        if lang_name
+                        else "No verified full-series playlist for this title on YouTube right now."
+                    )
             else:
-                st.info("No verified full movie for this title on YouTube right now.")
-
-        yt_play = st.session_state.get("yt_play")
-        if yt_play:
-            st.video(_safe_url(yt_play["embed"]))
-            st.markdown(f"[Watch on YouTube]({_safe_url(yt_play['link'])})")
+                st.subheader("Full Movie on YouTube")
+                if yt_results:
+                    st.caption(f"Verified uploads only (full-length, title clean). Pick one and play.{lang_note}")
+                    for r in yt_results:
+                        ycols = st.columns([1, 3, 1])
+                        with ycols[0]:
+                            if r.get("thumbnail"):
+                                st.image(r["thumbnail"], width=120)
+                                if st.button(
+                                    "⤢",
+                                    key=f"ytzoom-{r['video_id']}",
+                                    help="Show larger",
+                                    use_container_width=True,
+                                ):
+                                    _show_large_media(r["thumbnail"])
+                        with ycols[1]:
+                            al = r.get("audio_lang") or ""
+                            aw = _LANG_BY_ISO.get(al, "") or al
+                            audio_chip = f" · {_escape(aw)} audio" if aw else ""
+                            st.markdown(
+                                f"**{_escape(r['title'])}**  \n"
+                                f"{_escape(r['channel'])} · {r['duration']} min{audio_chip}"
+                            )
+                        with ycols[2]:
+                            st.link_button(
+                                "Play",
+                                _safe_url(r["link"]),
+                                use_container_width=True,
+                                type="primary",
+                            )
+                else:
+                    st.info(
+                        f"No {lang_name.title()} version found on YouTube right now."
+                        if lang_name
+                        else "No verified full movie for this title on YouTube right now."
+                    )
 
         st.divider()
         st.subheader("Watch for Free")
