@@ -310,6 +310,74 @@ _LANGUAGE_HINTS = {
     "german": ("de", "german"),
     "portuguese": ("pt", "portuguese"),
 }
+
+# Official broadcasters / studios that legally upload full movies & episodes.
+# Grouped per language for maintainability, but matched against EVERY group so
+# official channels are prioritized even when no language hint is given.
+# A channel is deemed official when every significant token of a whitelisted
+# name appears in its channel title (robust to casing / extra suffixes).
+_OFFICIAL_TV_CHANNELS = {
+    "ta": {"Kalaingar TV", "Sun TV", "Zee Tamil", "Star Vijay", "Jaya TV",
+           "Colors Tamil", "Polimer TV", "Vendhar TV", "Raj TV", "Thanthi TV"},
+    "hi": {"SET India", "Star Plus", "Sony SAB", "Colors TV", "Zee TV", "&TV"},
+    "te": {"ETV Cinema", "Zee Telugu", "Star Maa", "Gemini TV", "Eenadu TV"},
+    "ml": {"Asianet", "Mazhavil Manorama", "Surya TV", "Zee Keralam", "Flowers TV"},
+    "kn": {"Zee Kannada", "Colors Kannada", "Udaya TV", "Star Suvarna",
+           "Suvarna Plus", "Udaya Movies"},
+}
+
+_STUDIO_CHANNELS = {
+    "ta": {"Super Good Films", "Pyramid Music", "Vivel Cinema",
+           "Ayngaran International"},
+    "hi": {"Shemaroo", "Shree Krishna International", "Rajshri"},
+    "te": {"Annapurna Studios", "Geetha Arts"},
+    "en": {"Paramount Movies", "MGM", "StudioCanal"},
+}
+
+# Flattened whitelist names (shared across languages).
+_TV_CHANNEL_NAMES = []
+for _grp in _OFFICIAL_TV_CHANNELS.values():
+    for _name in _grp:
+        if _name not in _TV_CHANNEL_NAMES:
+            _TV_CHANNEL_NAMES.append(_name)
+
+_STUDIO_CHANNEL_NAMES = []
+for _grp in _STUDIO_CHANNELS.values():
+    for _name in _grp:
+        if _name not in _STUDIO_CHANNEL_NAMES:
+            _STUDIO_CHANNEL_NAMES.append(_name)
+
+_CHANNEL_TOKEN_CACHE = {}
+
+
+def _channel_tokens(name: str) -> frozenset:
+    cached = _CHANNEL_TOKEN_CACHE.get(name)
+    if cached is None:
+        cached = frozenset(_significant_tokens(name))
+        _CHANNEL_TOKEN_CACHE[name] = cached
+    return cached
+
+
+def _channel_tier(channel: str) -> str:
+    """Classify a YouTube channel title as 'tv', 'studio', or '' (other).
+
+    Matches when every significant token of a whitelisted name appears in the
+    channel title, so "Star Vijay" still matches "Star Vijay Tamil".
+    """
+    if not channel:
+        return ""
+    tokens = _channel_tokens(channel)
+    if not tokens:
+        return ""
+    for name in _TV_CHANNEL_NAMES:
+        if _channel_tokens(name) <= tokens:
+            return "tv"
+    for name in _STUDIO_CHANNEL_NAMES:
+        if _channel_tokens(name) <= tokens:
+            return "studio"
+    return ""
+
+
 _LANG_WORDS = sorted(_LANGUAGE_HINTS, key=len, reverse=True)
 _LANG_RE = re.compile(
     r"\b(?:in|with|audio|dub|dubbed|output|subtitles|sub)\s+(" + "|".join(_LANG_WORDS) + r")\b"
@@ -517,7 +585,7 @@ def youtube_full_movie(title: str, year: str = "", media_type: str = "", lang: s
             "q": query.strip(),
             "type": "video",
             "videoEmbeddable": "true",
-            "maxResults": 10,
+            "maxResults": 50,
             "key": YOUTUBE_API_KEY,
         }
         if marker:
@@ -533,11 +601,16 @@ def youtube_full_movie(title: str, year: str = "", media_type: str = "", lang: s
                 )
                 durations = {}
                 audio_langs = {}
+                statuses = {}
                 if ids:
                     videos = (
                         client.get(
                             YOUTUBE_VIDEOS_URL,
-                            params={"part": "snippet,contentDetails", "id": ids, "key": YOUTUBE_API_KEY},
+                            params={
+                                "part": "snippet,contentDetails,status",
+                                "id": ids,
+                                "key": YOUTUBE_API_KEY,
+                            },
                         )
                         .json()
                         .get("items", [])
@@ -549,6 +622,12 @@ def youtube_full_movie(title: str, year: str = "", media_type: str = "", lang: s
                         audio_langs[video["id"]] = _normalize_audio_lang(
                             (video.get("snippet", {}) or {}).get("defaultAudioLanguage")
                         )
+                        stt = video.get("status", {}) or {}
+                        statuses[video["id"]] = (
+                            stt.get("privacyStatus", ""),
+                            bool(stt.get("embeddable")),
+                            stt.get("uploadStatus", ""),
+                        )
         except httpx.HTTPError:
             return []
 
@@ -557,6 +636,16 @@ def youtube_full_movie(title: str, year: str = "", media_type: str = "", lang: s
             vid = item.get("id", {}).get("videoId", "")
             snippet = item.get("snippet", {})
             if not vid:
+                continue
+            # videos.list only returns existing videos, so a missing status
+            # means the link is dead (deleted/privated video) -> drop it.
+            status = statuses.get(vid)
+            if not status:
+                continue
+            privacy, embeddable, upload = status
+            if privacy != "public" or not embeddable:
+                continue
+            if upload and upload != "processed":
                 continue
             if durations.get(vid, 0) < min_length:
                 continue
@@ -578,6 +667,7 @@ def youtube_full_movie(title: str, year: str = "", media_type: str = "", lang: s
                     "video_id": vid,
                     "title": video_title,
                     "channel": channel,
+                    "official_tier": _channel_tier(channel),
                     "duration": durations[vid],
                     "audio_lang": audio,
                     "thumbnail": thumb,
@@ -590,9 +680,19 @@ def youtube_full_movie(title: str, year: str = "", media_type: str = "", lang: s
     if lang and not results:
         results = _collect(f"{title} {year} {marker} {keyword}")
 
+    # Drop unrelated uploads (no title/year overlap at all) UNLESS they come
+    # from an official TV channel. This kills e.g. a "Samudhiram" upload that
+    # YouTube surfaces for an "Anandham" query.
+    results = [
+        r for r in results
+        if r["official_tier"] == "tv" or _yt_relevance_score(r["title"], title, year) > 0
+    ]
+
+    _TIER_BONUS = {"tv": 300, "studio": 150}
     results.sort(
         key=lambda r: (
             _yt_relevance_score(r["title"], title, year)
+            + _TIER_BONUS.get(r["official_tier"], 0)
             + (60 if marker and marker in r["title"].lower() else 0),
             r["duration"],
         ),
@@ -704,16 +804,20 @@ def youtube_series_playlists(title: str, year: str = "", lang: str = "") -> list
                 continue
             thumb = snippet.get("thumbnails", {}).get("medium", {}).get("url", "") or ""
             item_count = counts[pid]
+            channel = _html.unescape(snippet.get("channelTitle") or "")
+            tier = _channel_tier(channel)
             score = (
                 _yt_relevance_score(playlist_title, title, year)
                 + min(item_count, 60)
                 + (60 if marker and marker in lower_title else 0)
+                + {"tv": 300, "studio": 150}.get(tier, 0)
             )
             results.append(
                 {
                     "playlist_id": pid,
                     "title": playlist_title,
-                    "channel": _html.unescape(snippet.get("channelTitle") or ""),
+                    "channel": channel,
+                    "official_tier": tier,
                     "item_count": item_count,
                     "thumbnail": thumb,
                     "link": f"https://www.youtube.com/playlist?list={pid}",
@@ -745,6 +849,7 @@ def youtube_series_playlists(title: str, year: str = "", lang: str = "") -> list
                         _yt_relevance_score(r["title"], title, year)
                         + min(r["item_count"], 60)
                         + (60 if marker and marker in r["title"].lower() else 0)
+                        + {"tv": 300, "studio": 150}.get(r.get("official_tier", ""), 0)
                         + (30 if lang in v else 0)
                     )
                     kept.append(r)
@@ -1445,7 +1550,7 @@ def main():
             if is_series:
                 st.subheader("Full Series on YouTube")
                 if yt_results:
-                    st.caption(f"Full-episode playlists (verified by size). Pick one and play.{lang_note}")
+                    st.caption(f"Full-episode playlists (verified by size). Official TV channels prioritized.{lang_note} Pick one and play.")
                     for r in yt_results:
                         ycols = st.columns([1, 3, 1])
                         with ycols[0]:
@@ -1461,9 +1566,12 @@ def main():
                         with ycols[1]:
                             al = r.get("audio_lang") or ""
                             audio_chip = f" · {_escape(al)} audio" if al else ""
+                            tier_tag = {"tv": " · Official TV", "studio": " · Official"}.get(
+                                r.get("official_tier", ""), ""
+                            )
                             st.markdown(
                                 f"**{_escape(r['title'])}**  \n"
-                                f"{_escape(r['channel'])} · {r.get('item_count')} episodes{audio_chip}"
+                                f"{_escape(r['channel'])} · {r.get('item_count')} episodes{audio_chip}{tier_tag}"
                             )
                         with ycols[2]:
                             st.link_button(
@@ -1481,7 +1589,7 @@ def main():
             else:
                 st.subheader("Full Movie on YouTube")
                 if yt_results:
-                    st.caption(f"Verified uploads only (full-length, title clean). Pick one and play.{lang_note}")
+                    st.caption(f"Verified uploads only (full-length, official channels prioritized). Pick one and play.{lang_note}")
                     for r in yt_results:
                         ycols = st.columns([1, 3, 1])
                         with ycols[0]:
@@ -1498,9 +1606,12 @@ def main():
                             al = r.get("audio_lang") or ""
                             aw = _LANG_BY_ISO.get(al, "") or al
                             audio_chip = f" · {_escape(aw)} audio" if aw else ""
+                            tier_tag = {"tv": " · Official TV", "studio": " · Official"}.get(
+                                r.get("official_tier", ""), ""
+                            )
                             st.markdown(
                                 f"**{_escape(r['title'])}**  \n"
-                                f"{_escape(r['channel'])} · {r['duration']} min{audio_chip}"
+                                f"{_escape(r['channel'])} · {r['duration']} min{audio_chip}{tier_tag}"
                             )
                         with ycols[2]:
                             st.link_button(
