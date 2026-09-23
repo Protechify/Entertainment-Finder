@@ -397,16 +397,20 @@ def _channel_tier(channel: str) -> str:
 _LANG_WORDS = sorted(_LANGUAGE_HINTS, key=len, reverse=True)
 _LANG_RE = re.compile(
     r"\b(?:in|with|audio|dub|dubbed|output|subtitles|sub)\s+(" + "|".join(_LANG_WORDS) + r")\b"
-    r"|\b(" + "|".join(_LANG_WORDS) + r")\s*(?:audio|dub|dubbed|version|subtitles|sub)?\b",
+    r"|\b(" + "|".join(_LANG_WORDS) + r")\s*(?:audio|dub|dubbed|version|subtitles|sub)\b",
     re.IGNORECASE,
 )
 
 
 def _extract_language_hint(query: str) -> tuple:
-    """Strip spoken-language hints ("in English", "Tamil") from a query.
+    """Strip spoken-language hints ("in English", "Tamil dub") from a query.
 
     Returns (clean_query, lang) where lang is the ISO 639-1 code of the first
     language mentioned, or '' when the query does not name a language.
+
+    Only UNambiguous "in <lang>" / "<lang> dub" style hints are removed — a
+    language word that is part of a movie title ("alagiya tamil magan",
+    "Hindi Medium") is kept in the search query.
     """
     lang = ""
     out = _LANG_RE.sub("", " " + query + " ")
@@ -1461,10 +1465,22 @@ def _title_score(query: str, title: str) -> int:
 
 
 def _relaxed_queries(query: str) -> list:
-    """Retry queries for the fuzzy fallback: raw query, significant tokens, and
-    prefixes of the longest token (JustWatch tokenizes short prefixes well)."""
+    """Retry queries for the fuzzy fallback: raw query, token windows, and
+    prefixes of the longest token (JustWatch tokenizes short prefixes well).
+
+    Token windows matter most: for "alagiya tamil magan" we ALSO probe each
+    word alone and every word-group ("tamil magan", "alagiya tamil", ...). A
+    single overlapping word (like "magan") is enough for JustWatch/OMDb to
+    surface the intended title when the user typed a different transliteration
+    of the other words (azhagiya/alagiya, tamizh/tamil). Single tokens are
+    ordered first because they are the fastest, highest-yield probes.
+    """
     tokens = _significant_tokens(query)
     relaxed = [query] + ([" ".join(tokens)] if tokens else [])
+    relaxed += tokens
+    for width in range(len(tokens), 1, -1):
+        for start in range(len(tokens) - width + 1):
+            relaxed.append(" ".join(tokens[start : start + width]))
     longest = max(tokens, key=len) if tokens else ""
     if len(longest) >= 4:
         relaxed += [longest[:n] for n in (8, 7, 6, 5, 4) if len(longest) >= n]
@@ -1474,7 +1490,7 @@ def _relaxed_queries(query: str) -> list:
         if key and key not in seen:
             seen.add(key)
             out.append(q)
-    return out
+    return out[:10]
 
 
 def _fuzzy_score(query: str, title: str) -> float:
@@ -1484,6 +1500,25 @@ def _fuzzy_score(query: str, title: str) -> float:
     if not q or not t:
         return 0.0
     return difflib.SequenceMatcher(None, q, t).ratio()
+
+
+def _fuzzy_suggest_score(query: str, title: str) -> float:
+    """Similarity plus a token-overlap bonus for the "did you mean" fallback.
+
+    A typo'd/transliterated query ("alagiya tamil magan") often scores high on
+    the corrected spelling, but when ≥50% of its significant words literally
+    appear in the candidate title (e.g. "tamil", "magan"), it is almost surely
+    the intended pick — lift it slightly while unrelated titles (ratio ~0.3)
+    stay far below the 0.82 cutoff.
+    """
+    score = _fuzzy_score(query, title)
+    q_tokens = _significant_tokens(query)
+    t_norm = _normalize_title(title)
+    if q_tokens and t_norm:
+        overlap = sum(1 for t in q_tokens if t in t_norm) / len(q_tokens)
+        if overlap >= 0.5:
+            score = min(1.0, score + 0.05 * overlap)
+    return score
 
 
 _MIN_SUGGEST_SCORE = 0.82
@@ -1531,18 +1566,18 @@ def fuzzy_suggest(query: str, limit: int = 3) -> list:
         return []
     queries = list(dict.fromkeys(
         [query]
-        + (_spelling_variants(query) if len(query) >= 6 else [])
         + _relaxed_queries(query)[1:]
-    ))[1:]  # raw query already searched by search()
+        + (_spelling_variants(query) if len(query) >= 6 else [])
+    ))[1:][:10]  # raw query already searched by search(); window probes first
     pool = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(queries) or 1)) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(queries) or 1)) as ex:
         futures = [
             ex.submit(_suggest_source, q, media_hint)
             for q in queries
         ]
         for fut in futures:
             try:
-                items = fut.result(timeout=25)
+                items = fut.result(timeout=45)
             except Exception:
                 continue
             for item in items:
@@ -1555,7 +1590,7 @@ def fuzzy_suggest(query: str, limit: int = 3) -> list:
     scored = [
         (score, item)
         for item in pool
-        if (score := _fuzzy_score(query, item["title"])) >= _MIN_SUGGEST_SCORE
+        if (score := _fuzzy_suggest_score(query, item["title"])) >= _MIN_SUGGEST_SCORE
         and len(_normalize_title(item["title"])) >= _MIN_SUGGEST_TITLE_LEN
     ]
     scored.sort(key=lambda pair: pair[0], reverse=True)
