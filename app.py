@@ -773,12 +773,13 @@ def youtube_full_movie(
     if lang and not results:
         results = _collect(f"{title} {year} {marker} {keyword}")
 
-    # Drop unrelated uploads (no title/year overlap at all) UNLESS they come
-    # from an official TV channel. This kills e.g. a "Samudhiram" upload that
-    # YouTube surfaces for an "Anandham" query.
+    # Drop unrelated uploads. Only results whose title genuinely IS the queried
+# movie (stand-alone name after removing upload markers like "full movie /
+# tamil / hd / cast buckets") pass — a "Aanandham Aarambam" upload must never
+# appear for an "Aanandham" query. Official TV channels keep a trust exemption.
     results = [
         r for r in results
-        if r["official_tier"] == "tv" or _yt_relevance_score(r["title"], title, year) > 0
+        if r["official_tier"] == "tv" or _yt_title_exact_match(r["title"], title)
     ]
 
     # Drop movies whose duration doesn't match the OMDb runtime (>15% off).
@@ -796,7 +797,7 @@ def youtube_full_movie(
         ),
         reverse=True,
     )
-    return results[:3]
+    return results[:2]
 
 
 def _yt_relevance_score(result_title: str, title: str, year: str) -> int:
@@ -819,10 +820,114 @@ def _yt_relevance_score(result_title: str, title: str, year: str) -> int:
     return score
 
 
+# Generic upload markers stripped from a title chunk before comparing it to
+# the queried movie name. Kept as words so compound chunks ("aanandham aarambam")
+# still fail the exact-name check while "aanandham full movie" still passes.
+_YT_TITLE_MARKERS = (
+    "full", "movie", "film", "hd", "4k", "2k", "dubbed", "dub", "audio",
+    "version", "english", "tamil", "hindi", "telugu", "malayalam", "kannada",
+    "blockbuster", "super", "hit", "superhit", "remastered", "rip", "ripped",
+    "dvd", "bluray", "web", "official", "online", "watch", "best", "quality",
+    "tamilrockers", "tamilyogi", "copyright", "song", "video",
+)
+
+
+def _yt_title_exact_match(result_title: str, title: str) -> bool:
+    """True only when a result's title names the queried movie exactly.
+
+    The title is split into chunks by typical upload separators, and each chunk
+    is checked after stripping generic markers ("full movie", "tamil", "hd",
+    year digits, ...) — so "Aanandham | Tamil Full Movie |..." passes but
+    "Aanandham Aarambam Tamil Full Movie" (a different film glued on) fails.
+    """
+    q = _normalize_title(title)
+    if not q:
+        return False
+    for chunk in re.split(r"[|,()\[\]:;_~*\-]+", result_title):
+        words = re.findall(r"[a-z0-9]+", chunk.lower())
+        core = "".join(
+            w for w in words
+            if w not in _YT_TITLE_MARKERS and not re.fullmatch(r"19\d\d|20\d\d", w)
+        )
+        if core == q:
+            return True
+    return False
+
+
 _YOUTUBE_PLAYLIST_BAD_WORDS = (
     "trailer", "teaser", "best moments", "movie", "review", "explained",
     "recap", "reaction", "music", "ending", "opening",
+    # Playlists that LOOK like full episodes but are actually compilations:
+    "interview", "panel", "featurette", "behind", "scenes", "bts",
+    "compilation", "moments", "funniest", "soundtrack", "ost", "countdown",
+    "ranking", "quiz", "theory", "news", "blooper", "documentary", "making",
 )
+
+# Playlist items that identify a playlist as NOT full episodes (trailers,
+# teasers, premieres, recaps, interviews, podcasts, VFX breakdowns...). A
+# playlist only counts when REAL numbered episodes are a strict majority of the
+# sampled items; one "Best Quality" episode upload never trips it.
+_YT_PLAYLIST_JUNK_RE = re.compile(
+    r"\b(?:trailer|teaser|tease|premiere|announcement|production|recap|review|"
+    r"reaction|interview|panel|featurette|behind|scenes|bts|compilation|best|"
+    r"moments|funniest|ending|opening|soundtrack|ost|song|music|score|cast|quiz|"
+    r"explained|theory|ranking|countdown|promo|clip|blooper|breakdown|deleted|"
+    r"spoiler|news|update|documentary|making|carpet|world|tour|vfx|podcast|"
+    r"scene|moment|celebration|comic|con|insider|live|feature|features|special|"
+    r"event|intros|outros|teases)\b",
+    re.IGNORECASE,
+)
+
+_YT_ITEM_EPISODE_RE = re.compile(
+    r"\b(?:episode|ep)\b|\be\d{1,3}\b|\bs\d{1,2}e\d{1,3}\b|"
+    r"\bpart \d\b|\bvol(?:ume)? \d\b|\bseason \d\b",
+    re.IGNORECASE,
+)
+
+
+def _playlist_is_full_episodes(playlist_id: str) -> bool:
+    """Confirm a playlist actually contains the show's episodes — or reject it.
+
+    Samples the first ~25 videos via playlistItems (one quota cost). The
+    playlist passes ONLY when numbered episode uploads are a strict majority of
+    the sample. "All things Season 3" style promotion playlists (trailers,
+    premieres, panels, bloopers, podcasts) contain zero or few real episodes and
+    are rejected — the user asked for the exact full episodes or nothing.
+    """
+    try:
+        with httpx.Client(timeout=10) as client:
+            data = (
+                client.get(
+                    "https://www.googleapis.com/youtube/v3/playlistItems",
+                    params={
+                        "part": "snippet",
+                        "playlistId": playlist_id,
+                        "maxResults": 25,
+                        "key": YOUTUBE_API_KEY,
+                    },
+                )
+                .json()
+                .get("items", [])
+            )
+    except httpx.HTTPError:
+        return True
+    titles = [_html.unescape(it.get("snippet", {}).get("title") or "") for it in data]
+    if not titles:
+        return True
+    episode = junk = 0
+    for item in titles:
+        il = item.lower()
+        if _YT_ITEM_EPISODE_RE.search(il):
+            episode += 1
+        elif _YT_PLAYLIST_JUNK_RE.search(il):
+            junk += 1
+    if episode == 0:
+        return False
+    if episode * 2 <= len(titles):
+        return False
+    if junk and junk >= episode:
+        return False
+    return True
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -936,9 +1041,16 @@ def youtube_series_playlists(
                 }
             )
         results.sort(key=lambda r: r["_score"], reverse=True)
+        kept = []
         for r in results:
+            if not _playlist_is_full_episodes(r["playlist_id"]):
+                continue
+            kept.append(r)
+            if len(kept) >= 3:
+                break
+        for r in kept:
             r.pop("_score", None)
-        return results
+        return kept
 
     results = _try_query(f"{title} {year} full episodes".strip())
     if not results and year:
@@ -978,6 +1090,173 @@ def youtube_series_playlists(
         return kept[:3]
 
     return results[:3]
+
+
+_YT_EPISODE_RE = re.compile(
+    r"\b(?:episode|ep|e)\s*\.?\s*(\d{1,3})\b|\bs(\d{1,2})\s*e(\d{1,3})\b",
+    re.IGNORECASE,
+)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def youtube_series_episodes(
+    title: str, year: str = "", lang: str = "", season: int = 0
+) -> list:
+    """Find individual full-episode uploads for a TV series / anime.
+
+    Searches for the series' episodes as separate videos (common for anime),
+    keeps only working, full-length uploads that name an episode number, and
+    hides reaction/junk channels. When a season is provided, uploads that name
+    a DIFFERENT season are dropped; when no season marker is present the video
+    is kept (ambigous first-episode listings). Duplicate episode numbers are
+    deduped (best one wins) and results are capped at 6, Episode 1 first.
+    """
+    if not YOUTUBE_API_KEY:
+        return []
+    marker = _LANGUAGE_HINTS.get(lang, (None, ""))[1]
+    need = _significant_tokens(title)
+
+    def _try_query(query: str) -> list:
+        if not query.strip():
+            return []
+        params = {
+            "part": "snippet",
+            "q": query.strip(),
+            "type": "video",
+            "videoEmbeddable": "true",
+            "maxResults": 50,
+            "key": YOUTUBE_API_KEY,
+        }
+        if marker:
+            params["relevanceLanguage"] = lang
+        try:
+            with httpx.Client(timeout=10) as client:
+                data = client.get(YOUTUBE_SEARCH_URL, params=params).json()
+                items = data.get("items", [])
+                ids = ",".join(
+                    item["id"]["videoId"]
+                    for item in items
+                    if item.get("id", {}).get("videoId")
+                )
+                durations, audio_langs, statuses, descriptions = {}, {}, {}, {}
+                if ids:
+                    videos = (
+                        client.get(
+                            YOUTUBE_VIDEOS_URL,
+                            params={
+                                "part": "snippet,contentDetails,status",
+                                "id": ids,
+                                "key": YOUTUBE_API_KEY,
+                            },
+                        )
+                        .json()
+                        .get("items", [])
+                    )
+                    for video in videos:
+                        durations[video["id"]] = _youtube_duration_minutes(
+                            video.get("contentDetails", {}).get("duration", "")
+                        )
+                        audio_langs[video["id"]] = _normalize_audio_lang(
+                            video.get("snippet", {}).get("defaultAudioLanguage")
+                        )
+                        stt = video.get("status", {}) or {}
+                        statuses[video["id"]] = (
+                            stt.get("privacyStatus", ""),
+                            bool(stt.get("embeddable")),
+                            stt.get("uploadStatus", ""),
+                        )
+                        desc = _html.unescape(video.get("snippet", {}).get("description") or "")
+                        descriptions[video["id"]] = desc[:400]
+        except httpx.HTTPError:
+            return []
+
+        results = []
+        for item in items:
+            vid = item.get("id", {}).get("videoId", "")
+            snippet = item.get("snippet", {})
+            if not vid:
+                continue
+            privacy, embeddable, upload_status = statuses.get(vid, ("", False, ""))
+            if privacy != "public" or not embeddable or (upload_status and upload_status != "processed"):
+                continue
+            if durations.get(vid, 0) < 15:
+                continue
+            video_title = _html.unescape(snippet.get("title") or "")
+            channel = _html.unescape(snippet.get("channelTitle") or "")
+            lower_title = video_title.lower()
+            if any(word in lower_title for word in _YOUTUBE_BAD_WORDS):
+                continue
+            if _looks_like_reaction(channel, video_title, descriptions.get(vid, "")):
+                continue
+            rt = _normalize_title(video_title)
+            if not rt or not all(token in rt for token in need):
+                continue
+            if season:
+                sm = re.search(r"\bs(\d{1,2})\b", lower_title)
+                if sm and int(sm.group(1)) != season:
+                    continue
+            m = _YT_EPISODE_RE.search(lower_title)
+            if not m:
+                continue
+            episode_num = int(m.group(1) or m.group(3))
+            if season and m.group(2) and int(m.group(2)) != season:
+                continue
+            audio = audio_langs.get(vid, "")
+            if lang:
+                if audio and audio != lang:
+                    continue
+                if _other_lang_audio(video_title, lang):
+                    continue
+                if not _confirm_lang(video_title, audio, lang):
+                    continue
+            thumb = snippet.get("thumbnails", {}).get("medium", {}).get("url", "") or ""
+            tier = _channel_tier(channel)
+            score = (
+                _yt_relevance_score(video_title, title, year)
+                + {"tv": 300, "studio": 150}.get(tier, 0)
+                + (30 if marker and marker in lower_title else 0)
+            )
+            results.append(
+                {
+                    "video_id": vid,
+                    "title": video_title,
+                    "channel": channel,
+                    "official_tier": tier,
+                    "duration": durations[vid],
+                    "audio_lang": audio,
+                    "thumbnail": thumb,
+                    "episode": episode_num,
+                    "link": f"https://www.youtube.com/watch?v={vid}",
+                    "_score": score,
+                }
+            )
+        out = sorted(results, key=lambda r: (-r["_score"], r["episode"]))
+        return out
+
+    all_results = []
+    season_q = f" s{season}" if season else ""
+    all_results = (
+        _try_query(f"{title}{season_q} full episode".strip())
+        or _try_query(f"{title} episode 1".strip())
+        or _try_query(f"{title}{season_q} episode".strip())
+    )
+    if not all_results and lang and marker:
+        all_results = _try_query(f"{title}{season_q} {marker} episode".strip())
+    if not all_results:
+        return []
+
+    seen = set()
+    kept = []
+    for r in all_results:
+        episode_key = (season, r["episode"]) if season else r["episode"]
+        if episode_key in seen:
+            continue
+        seen.add(episode_key)
+        kept.append(r)
+    kept.sort(key=lambda r: (-r["_score"], r["episode"]))
+    for r in kept:
+        r.pop("_score", None)
+    return kept[:6]
 
 
 def _verify_playlist_languages(playlist_ids: list) -> dict:
@@ -1510,8 +1789,16 @@ def _render_result_cards(items: list):
                         item["title"], item.get("year") or "", item["media_type"], lang,
                         _omdb_runtime_minutes(details) or 0,
                     )
+                    st.session_state.pop("yt_episodes", None)
                 else:
-                    st.session_state.pop("yt_results", None)
+                    season_num = season or 0
+                    st.session_state["yt_results"] = youtube_series_playlists(
+                        item["title"], item.get("year") or "", lang,
+                        _omdb_season_episode_count(details, season_num) or 0,
+                    )
+                    st.session_state["yt_episodes"] = youtube_series_episodes(
+                        item["title"], item.get("year") or "", lang, season_num,
+                    )
 
 
 def main():
@@ -1546,6 +1833,7 @@ def main():
         st.session_state.pop("providers", None)
         st.session_state.pop("details", None)
         st.session_state.pop("yt_results", None)
+        st.session_state.pop("yt_episodes", None)
         if not results and not suggestions:
             if hint_label:
                 type_name = "Movie" if hint_label == "movie" else "TV series"
@@ -1656,7 +1944,7 @@ def main():
 
         yt_results = st.session_state.get("yt_results") or []
         is_series = selected.get("media_type") == "tv"
-        if YOUTUBE_API_KEY and not is_series:
+        if YOUTUBE_API_KEY:
             st.divider()
             yt_lang = st.session_state.get("yt_lang") or ""
             lang_name = next(
@@ -1701,6 +1989,48 @@ def main():
                         f"No {lang_name.title()} full-series playlist for this title on YouTube right now."
                         if lang_name
                         else "No verified full-series playlist for this title on YouTube right now."
+                    )
+                st.subheader("Episodes on YouTube")
+                yt_episodes = st.session_state.get("yt_episodes") or []
+                if yt_episodes:
+                    st.caption(
+                        f"Individual full episodes, verified by length and title.{lang_note} Official channels prioritized — Episode 1 first."
+                    )
+                    for r in yt_episodes:
+                        ycols = st.columns([1, 3, 1])
+                        with ycols[0]:
+                            if r.get("thumbnail"):
+                                st.image(r["thumbnail"], width=120)
+                                if st.button(
+                                    "⤢",
+                                    key=f"ytzoom-{r['video_id']}",
+                                    help="Show larger",
+                                    use_container_width=True,
+                                ):
+                                    _show_large_media(r["thumbnail"])
+                        with ycols[1]:
+                            al = r.get("audio_lang") or ""
+                            aw = _LANG_BY_ISO.get(al, "") or al
+                            audio_chip = f" · {_escape(aw)} audio" if aw else ""
+                            tier_tag = {"tv": " · Official TV", "studio": " · Official"}.get(
+                                r.get("official_tier", ""), ""
+                            )
+                            st.markdown(
+                                f"**{_escape(r['title'])}**  \n"
+                                f"{_escape(r['channel'])} · Ep {r.get('episode')} · {r['duration']} min{audio_chip}{tier_tag}"
+                            )
+                        with ycols[2]:
+                            st.link_button(
+                                "Play",
+                                _safe_url(r["link"]),
+                                use_container_width=True,
+                                type="primary",
+                            )
+                else:
+                    st.info(
+                        f"No {lang_name.title()} individual full episodes found for this title right now."
+                        if lang_name
+                        else "No verified individual full episodes found for this title right now."
                     )
             else:
                 st.subheader("Full Movie on YouTube")
