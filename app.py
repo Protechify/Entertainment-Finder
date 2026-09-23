@@ -293,6 +293,22 @@ def _extract_media_hint(query: str) -> tuple:
     return " ".join(words[:-1]).strip(), hint
 
 
+def _extract_season(query: str) -> tuple:
+    """Strip a season qualifier ('Season 1', 's1') from a query.
+
+    Returns (clean_query, season) where season is an int or None.
+    "Stranger Things Season 1" -> ("Stranger Things", 1). Titles that merely
+    contain the word "season" without a number are left untouched.
+    """
+    m = re.search(r"\bseason\s+(\d{1,2})\b", query, re.IGNORECASE) or re.search(
+        r"\bs(\d{1,2})\b", query, re.IGNORECASE
+    )
+    if not m:
+        return query.strip(), None
+    return re.sub(r"\bseason\s+\d{1,2}\b|\bs\d{1,2}\b", "", query,
+                  flags=re.IGNORECASE).strip(), int(m.group(1))
+
+
 # Spoken language hints ("in English", "Tamil dub", ...) -> (ISO code, keyword).
 _LANGUAGE_HINTS = {
     "english": ("en", "english"),
@@ -544,6 +560,35 @@ def omdb_details(selected: dict) -> dict:
     return data
 
 
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _omdb_season_episode_count(details: dict, season: int) -> int:
+    """Number of episodes in a series season via OMDb's Season endpoint.
+
+    Returns 0 when it can't be determined (missing imdb id, bad season,
+    API error) so the caller skips the episode-count check instead of
+    wrongly hiding every result.
+    """
+    if not season:
+        return 0
+    imdb_id = (details or {}).get("imdbID") or (details or {}).get("id") or ""
+    if not imdb_id.startswith("tt"):
+        return 0
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.get(
+                OMDB_BASE,
+                params={"apikey": OMDB_API_KEY, "i": imdb_id, "Season": season},
+            )
+            data = resp.json()
+    except httpx.HTTPError:
+        return 0
+    if data.get("Response") != "True":
+        return 0
+    episodes = data.get("Episodes") or []
+    count = len(episodes)
+    return count if count > 0 else 0
+
+
 _YOUTUBE_ISO_RE = re.compile(r"P(?:(\d+)D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
 
 
@@ -560,9 +605,41 @@ _YOUTUBE_BAD_WORDS = (
     "trailer", "teaser", "review", "explained", "recap", "reaction", "music video"
 )
 
+# Reaction ("person watches the movie") uploads. They often retitle the video
+# to look like the real film, so we scan the channel name + title + description
+# (all already returned by part=snippet — no extra API quota).
+_REACTION_RE = re.compile(
+    r"\breact(?:ion|ing|ed|s)?\b"
+    r"|first time (?:watching|seeing|hearing)"
+    r"|watch(?:ing)? (?:along|for the first time)"
+    r"|our reaction|live reaction|commentary",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_reaction(channel: str, title: str, description: str = "") -> bool:
+    """True when a channel/title/description marks an upload as a reaction video.
+
+    Reaction channels self-identify ("Reacting To...", "XYZ Reacts"), and their
+    descriptions explain that the actual movie/episode is being watched/comment.
+    """
+    blob = " | ".join(
+        p for p in (channel or "", title or "", description or "") if p
+    )
+    return bool(_REACTION_RE.search(blob))
+
+
+def _omdb_runtime_minutes(details: dict) -> int:
+    """OMDb movie 'Runtime' ("110 min") -> total minutes; 0 if missing/invalid."""
+    runtime = str((details or {}).get("Runtime") or "")
+    m = re.search(r"(\d+)", runtime)
+    return int(m.group(1)) if m else 0
+
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def youtube_full_movie(title: str, year: str = "", media_type: str = "", lang: str = "") -> list:
+def youtube_full_movie(
+    title: str, year: str = "", media_type: str = "", lang: str = "", expected_minutes: int = 0
+) -> list:
     """Find YouTube uploads that are actually full movies / full episodes.
 
     Searches YouTube "full movie" / "full episodes", then fetches every video's
@@ -570,6 +647,8 @@ def youtube_full_movie(title: str, year: str = "", media_type: str = "", lang: s
     film or episode (trailers, recaps, and explainers are far shorter and are
     also title-filtered). Results are ranked by title+year match (top 3). A
     language hint (e.g. 'ta') biases the search and boosts matching titles.
+    When `expected_minutes` is given (movie runtime from OMDb), uploads whose
+    duration deviates >15% are flagged and ranked below matching-length ones.
     """
     if not YOUTUBE_API_KEY:
         return []
@@ -602,6 +681,7 @@ def youtube_full_movie(title: str, year: str = "", media_type: str = "", lang: s
                 durations = {}
                 audio_langs = {}
                 statuses = {}
+                descriptions = {}
                 if ids:
                     videos = (
                         client.get(
@@ -621,6 +701,9 @@ def youtube_full_movie(title: str, year: str = "", media_type: str = "", lang: s
                         )
                         audio_langs[video["id"]] = _normalize_audio_lang(
                             (video.get("snippet", {}) or {}).get("defaultAudioLanguage")
+                        )
+                        descriptions[video["id"]] = (
+                            (video.get("snippet", {}) or {}).get("description", "") or ""
                         )
                         stt = video.get("status", {}) or {}
                         statuses[video["id"]] = (
@@ -653,6 +736,10 @@ def youtube_full_movie(title: str, year: str = "", media_type: str = "", lang: s
             channel = _html.unescape(snippet.get("channelTitle") or "")
             if any(word in video_title.lower() for word in _YOUTUBE_BAD_WORDS):
                 continue
+            # Reaction uploads retitle videos to look like the real film, so the
+            # title filter isn't enough — scan channel + title + description too.
+            if _looks_like_reaction(channel, video_title, descriptions.get(vid, "")):
+                continue
             audio = audio_langs.get(vid, "")
             if lang:
                 if audio and audio != lang:
@@ -662,15 +749,21 @@ def youtube_full_movie(title: str, year: str = "", media_type: str = "", lang: s
                 if not _confirm_lang(video_title, audio, lang):
                     continue
             thumb = snippet.get("thumbnails", {}).get("medium", {}).get("url", "") or ""
+            duration = durations[vid]
+            mismatch = (
+                expected_minutes > 0
+                and abs(duration - expected_minutes) > 0.15 * expected_minutes
+            )
             picked.append(
                 {
                     "video_id": vid,
                     "title": video_title,
                     "channel": channel,
                     "official_tier": _channel_tier(channel),
-                    "duration": durations[vid],
+                    "duration": duration,
                     "audio_lang": audio,
                     "thumbnail": thumb,
+                    "duration_mismatch": mismatch,
                     "link": f"https://www.youtube.com/watch?v={vid}",
                 }
             )
@@ -687,6 +780,11 @@ def youtube_full_movie(title: str, year: str = "", media_type: str = "", lang: s
         r for r in results
         if r["official_tier"] == "tv" or _yt_relevance_score(r["title"], title, year) > 0
     ]
+
+    # Drop movies whose duration doesn't match the OMDb runtime (>15% off).
+    # Only set when an OMDb runtime exists, so this never affects TV series
+    # or movies with no reference runtime.
+    results = [r for r in results if not r.get("duration_mismatch")]
 
     _TIER_BONUS = {"tv": 300, "studio": 150}
     results.sort(
@@ -728,7 +826,9 @@ _YOUTUBE_PLAYLIST_BAD_WORDS = (
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def youtube_series_playlists(title: str, year: str = "", lang: str = "") -> list:
+def youtube_series_playlists(
+    title: str, year: str = "", lang: str = "", expected_episodes: int = 0
+) -> list:
     """Find full-series playlists on YouTube for a TV series.
 
     Searches YouTube for playlists of the series' full episodes, fetches each
@@ -739,6 +839,8 @@ def youtube_series_playlists(title: str, year: str = "", lang: str = "") -> list
     A language hint additionally shows only playlists CONFIRMED to be in that
     language (title claim or video audio check), trying a language-word query
     when the plain search finds none.
+    When `expected_episodes` > 0 (e.g. OMDb season episode count), playlists
+    whose item count does not EXACTLY match it are hidden.
     """
     if not YOUTUBE_API_KEY:
         return []
@@ -794,6 +896,11 @@ def youtube_series_playlists(title: str, year: str = "", lang: str = "") -> list
             playlist_title = _html.unescape(snippet.get("title") or "")
             if counts.get(pid, 0) < 5:
                 continue
+            # Strict episode-count verification: a playlist whose item count
+            # differs from the expected season episode count is a wrong/mixed
+            # upload — never show it.
+            if expected_episodes > 0 and counts.get(pid, 0) != expected_episodes:
+                continue
             lower_title = playlist_title.lower()
             if any(word in lower_title for word in _YOUTUBE_PLAYLIST_BAD_WORDS):
                 continue
@@ -805,6 +912,10 @@ def youtube_series_playlists(title: str, year: str = "", lang: str = "") -> list
             thumb = snippet.get("thumbnails", {}).get("medium", {}).get("url", "") or ""
             item_count = counts[pid]
             channel = _html.unescape(snippet.get("channelTitle") or "")
+            # Reaction channels build "watch the whole series" playlists too —
+            # drop them using channel + title + description signals.
+            if _looks_like_reaction(channel, playlist_title, snippet.get("description") or ""):
+                continue
             tier = _channel_tier(channel)
             score = (
                 _yt_relevance_score(playlist_title, title, year)
@@ -1388,17 +1499,23 @@ def _render_result_cards(items: list):
             )
         if cols[2].button("Select", key=f"select-{item['id']}", use_container_width=True):
             with st.spinner("Loading details, providers & YouTube matches..."):
-                st.session_state["selected"] = item
+                season = st.session_state.get("season")
+                st.session_state["selected"] = {**item, "season": season}
                 st.session_state["providers"] = get_providers(item)
-                st.session_state["details"] = omdb_details(item)
+                details = omdb_details(item)
+                st.session_state["details"] = details
                 lang = st.session_state.get("yt_lang") or ""
                 if item["media_type"] == "tv":
+                    expected = (
+                        _omdb_season_episode_count(details, season) if season else 0
+                    )
                     st.session_state["yt_results"] = youtube_series_playlists(
-                        item["title"], item.get("year") or "", lang
+                        item["title"], item.get("year") or "", lang, expected
                     )
                 else:
                     st.session_state["yt_results"] = youtube_full_movie(
-                        item["title"], item.get("year") or "", item["media_type"], lang
+                        item["title"], item.get("year") or "", item["media_type"], lang,
+                        _omdb_runtime_minutes(details) or 0,
                     )
 
 
@@ -1421,6 +1538,8 @@ def main():
 
     if submitted:
         _, hint_label, lang = _extract_hints(query)
+        query, season = _extract_season(query)
+        st.session_state["season"] = season
         with st.spinner("Searching movies & shows..."):
             results = search(query)
             suggestions = fuzzy_suggest(query) if not results else []
