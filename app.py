@@ -1505,18 +1505,13 @@ def _render_result_cards(items: list):
                 details = omdb_details(item)
                 st.session_state["details"] = details
                 lang = st.session_state.get("yt_lang") or ""
-                if item["media_type"] == "tv":
-                    expected = (
-                        _omdb_season_episode_count(details, season) if season else 0
-                    )
-                    st.session_state["yt_results"] = youtube_series_playlists(
-                        item["title"], item.get("year") or "", lang, expected
-                    )
-                else:
+                if item["media_type"] == "movie":
                     st.session_state["yt_results"] = youtube_full_movie(
                         item["title"], item.get("year") or "", item["media_type"], lang,
                         _omdb_runtime_minutes(details) or 0,
                     )
+                else:
+                    st.session_state.pop("yt_results", None)
 
 
 def main():
@@ -1660,9 +1655,9 @@ def main():
             st.info("No paid streaming platform offers this title in India right now.")
 
         yt_results = st.session_state.get("yt_results") or []
-        if YOUTUBE_API_KEY:
+        is_series = selected.get("media_type") == "tv"
+        if YOUTUBE_API_KEY and not is_series:
             st.divider()
-            is_series = selected.get("media_type") == "tv"
             yt_lang = st.session_state.get("yt_lang") or ""
             lang_name = next(
                 (k for k, (iso, m) in _LANGUAGE_HINTS.items() if iso == yt_lang), ""
