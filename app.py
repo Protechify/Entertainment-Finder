@@ -861,6 +861,9 @@ _YOUTUBE_PLAYLIST_BAD_WORDS = (
     "interview", "panel", "featurette", "behind", "scenes", "bts",
     "compilation", "moments", "funniest", "soundtrack", "ost", "countdown",
     "ranking", "quiz", "theory", "news", "blooper", "documentary", "making",
+    # Netflix "Inside the Episodes" / companion talk-show style lists:
+    "inside the episodes", "still watching", "watch along", "after show",
+    "aftershow", "discussion", "official podcast", "companion",
 )
 
 # Playlist items that identify a playlist as NOT full episodes (trailers,
@@ -881,6 +884,19 @@ _YT_PLAYLIST_JUNK_RE = re.compile(
 _YT_ITEM_EPISODE_RE = re.compile(
     r"\b(?:episode|ep)\b|\be\d{1,3}\b|\bs\d{1,2}e\d{1,3}\b|"
     r"\bpart \d\b|\bvol(?:ume)? \d\b|\bseason \d\b",
+    re.IGNORECASE,
+)
+
+# Companion/behind-the-scenes content that numbers its entries like episodes
+# ("Inside the Episodes | Episode 1", "Official Podcast: E5", "Watch Along #3")
+# but is NOT the actual series. Checked BEFORE the episode marker so these
+# numbered companion items count as junk, never as real episodes.
+_YT_PLAYLIST_JUNK_PHRASES = re.compile(
+    r"inside\s+the\s+episodes|watch\s+along|after\s+show|aftershow|"
+    r"discussion|official\s+podcast|companion|talk\s+show|making\s+of|"
+    r"behind\s+the\s+scenes|recap\s+series|still\s+watching|"
+    r"re-?watch|reaction\s+podcast|deep\s+dive|explained\s+series|"
+    r"round\s*table|cast\s+commentary|audio\s+commentary|director'?s\s+commentary",
     re.IGNORECASE,
 )
 
@@ -917,7 +933,9 @@ def _playlist_is_full_episodes(playlist_id: str) -> bool:
     episode = junk = 0
     for item in titles:
         il = item.lower()
-        if _YT_ITEM_EPISODE_RE.search(il):
+        if _YT_PLAYLIST_JUNK_PHRASES.search(il):
+            junk += 1
+        elif _YT_ITEM_EPISODE_RE.search(il):
             episode += 1
         elif _YT_PLAYLIST_JUNK_RE.search(il):
             junk += 1
@@ -1187,6 +1205,11 @@ def youtube_series_episodes(
             if any(word in lower_title for word in _YOUTUBE_BAD_WORDS):
                 continue
             if _looks_like_reaction(channel, video_title, descriptions.get(vid, "")):
+                continue
+            if (
+                _YT_PLAYLIST_JUNK_PHRASES.search(video_title)
+                or _YT_PLAYLIST_JUNK_PHRASES.search(channel)
+            ):
                 continue
             rt = _normalize_title(video_title)
             if not rt or not all(token in rt for token in need):
