@@ -2009,9 +2009,9 @@ def main():
                             )
                 else:
                     st.info(
-                        f"No {lang_name.title()} full-series playlist for this title on YouTube right now."
+                        f"Full-series playlist not available on YouTube in {lang_name.title()} right now."
                         if lang_name
-                        else "No verified full-series playlist for this title on YouTube right now."
+                        else "Full-series playlist not available on YouTube right now."
                     )
                 st.subheader("Episodes on YouTube")
                 yt_episodes = st.session_state.get("yt_episodes") or []
@@ -2051,9 +2051,9 @@ def main():
                             )
                 else:
                     st.info(
-                        f"No {lang_name.title()} individual full episodes found for this title right now."
+                        f"Episodes not available on YouTube in {lang_name.title()} right now."
                         if lang_name
-                        else "No verified individual full episodes found for this title right now."
+                        else "Episodes not available on YouTube right now."
                     )
             else:
                 st.subheader("Full Movie on YouTube")
