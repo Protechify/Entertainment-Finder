@@ -1387,18 +1387,19 @@ def _render_result_cards(items: list):
                 unsafe_allow_html=True,
             )
         if cols[2].button("Select", key=f"select-{item['id']}", use_container_width=True):
-            st.session_state["selected"] = item
-            st.session_state["providers"] = get_providers(item)
-            st.session_state["details"] = omdb_details(item)
-            lang = st.session_state.get("yt_lang") or ""
-            if item["media_type"] == "tv":
-                st.session_state["yt_results"] = youtube_series_playlists(
-                    item["title"], item.get("year") or "", lang
-                )
-            else:
-                st.session_state["yt_results"] = youtube_full_movie(
-                    item["title"], item.get("year") or "", item["media_type"], lang
-                )
+            with st.spinner("Loading details, providers & YouTube matches..."):
+                st.session_state["selected"] = item
+                st.session_state["providers"] = get_providers(item)
+                st.session_state["details"] = omdb_details(item)
+                lang = st.session_state.get("yt_lang") or ""
+                if item["media_type"] == "tv":
+                    st.session_state["yt_results"] = youtube_series_playlists(
+                        item["title"], item.get("year") or "", lang
+                    )
+                else:
+                    st.session_state["yt_results"] = youtube_full_movie(
+                        item["title"], item.get("year") or "", item["media_type"], lang
+                    )
 
 
 def main():
@@ -1420,8 +1421,9 @@ def main():
 
     if submitted:
         _, hint_label, lang = _extract_hints(query)
-        results = search(query)
-        suggestions = fuzzy_suggest(query) if not results else []
+        with st.spinner("Searching movies & shows..."):
+            results = search(query)
+            suggestions = fuzzy_suggest(query) if not results else []
         st.session_state["results"] = results
         st.session_state["suggestions"] = suggestions
         st.session_state["hint_label"] = hint_label
@@ -1482,7 +1484,7 @@ def main():
         if not details:
             st.info("Couldn't load description & reviews for this title.")
         else:
-            st.subheader("Synopsis")
+            st.subheader("Description:")
             plot = (details.get("Plot") or "").strip()
             if plot and plot != "N/A":
                 st.markdown(plot)
