@@ -1484,7 +1484,7 @@ def main():
         if not details:
             st.info("Couldn't load description & reviews for this title.")
         else:
-            st.subheader("Description:")
+            st.subheader("Description")
             plot = (details.get("Plot") or "").strip()
             if plot and plot != "N/A":
                 st.markdown(plot)
