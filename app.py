@@ -1812,15 +1812,11 @@ def _render_result_cards(items: list):
                         item["title"], item.get("year") or "", item["media_type"], lang,
                         _omdb_runtime_minutes(details) or 0,
                     )
-                    st.session_state.pop("yt_episodes", None)
                 else:
                     season_num = season or 0
                     st.session_state["yt_results"] = youtube_series_playlists(
                         item["title"], item.get("year") or "", lang,
                         _omdb_season_episode_count(details, season_num) or 0,
-                    )
-                    st.session_state["yt_episodes"] = youtube_series_episodes(
-                        item["title"], item.get("year") or "", lang, season_num,
                     )
 
 
@@ -1856,7 +1852,6 @@ def main():
         st.session_state.pop("providers", None)
         st.session_state.pop("details", None)
         st.session_state.pop("yt_results", None)
-        st.session_state.pop("yt_episodes", None)
         if not results and not suggestions:
             if hint_label:
                 type_name = "Movie" if hint_label == "movie" else "TV series"
@@ -2012,48 +2007,6 @@ def main():
                         f"Full-series playlist not available on YouTube in {lang_name.title()} right now."
                         if lang_name
                         else "Full-series playlist not available on YouTube right now."
-                    )
-                st.subheader("Episodes on YouTube")
-                yt_episodes = st.session_state.get("yt_episodes") or []
-                if yt_episodes:
-                    st.caption(
-                        f"Individual full episodes, verified by length and title.{lang_note} Official channels prioritized — Episode 1 first."
-                    )
-                    for r in yt_episodes:
-                        ycols = st.columns([1, 3, 1])
-                        with ycols[0]:
-                            if r.get("thumbnail"):
-                                st.image(r["thumbnail"], width=120)
-                                if st.button(
-                                    "⤢",
-                                    key=f"ytzoom-{r['video_id']}",
-                                    help="Show larger",
-                                    use_container_width=True,
-                                ):
-                                    _show_large_media(r["thumbnail"])
-                        with ycols[1]:
-                            al = r.get("audio_lang") or ""
-                            aw = _LANG_BY_ISO.get(al, "") or al
-                            audio_chip = f" · {_escape(aw)} audio" if aw else ""
-                            tier_tag = {"tv": " · Official TV", "studio": " · Official"}.get(
-                                r.get("official_tier", ""), ""
-                            )
-                            st.markdown(
-                                f"**{_escape(r['title'])}**  \n"
-                                f"{_escape(r['channel'])} · Ep {r.get('episode')} · {r['duration']} min{audio_chip}{tier_tag}"
-                            )
-                        with ycols[2]:
-                            st.link_button(
-                                "Play",
-                                _safe_url(r["link"]),
-                                use_container_width=True,
-                                type="primary",
-                            )
-                else:
-                    st.info(
-                        f"Episodes not available on YouTube in {lang_name.title()} right now."
-                        if lang_name
-                        else "Episodes not available on YouTube right now."
                     )
             else:
                 st.subheader("Full Movie on YouTube")
