@@ -350,6 +350,18 @@ _STUDIO_CHANNELS = {
     "en": {"Paramount Movies", "MGM", "StudioCanal"},
 }
 
+# Curated channels known to legitimately host full movies on YouTube (labels /
+# official film-company channels). Matched token-subset like the TV/studio
+# lists, so "Goldmines" also matches "Goldmines Hindi". Bonus: keep the shortest
+# distinctive name plus any variants that need extra tokens to disambiguate.
+_OFFICIAL_MOVIE_CHANNELS = {
+    "en": {"Paramount Movies", "MGM", "StudioCanal", "Lionsgate Movies",
+           "20th Century Studios"},
+    "hi": {"Shemaroo", "Rajshri", "T-Series", "Goldmines",
+           "Goldmines Telefilms", "Goldmines Hindi"},
+    "ta": {"Sun Pictures", "Sun NXT", "Zee Studios", "AVM Productions"},
+}
+
 # Flattened whitelist names (shared across languages).
 _TV_CHANNEL_NAMES = []
 for _grp in _OFFICIAL_TV_CHANNELS.values():
@@ -362,6 +374,12 @@ for _grp in _STUDIO_CHANNELS.values():
     for _name in _grp:
         if _name not in _STUDIO_CHANNEL_NAMES:
             _STUDIO_CHANNEL_NAMES.append(_name)
+
+_MOVIE_CHANNEL_NAMES = []
+for _grp in _OFFICIAL_MOVIE_CHANNELS.values():
+    for _name in _grp:
+        if _name not in _MOVIE_CHANNEL_NAMES:
+            _MOVIE_CHANNEL_NAMES.append(_name)
 
 _CHANNEL_TOKEN_CACHE = {}
 
@@ -391,6 +409,9 @@ def _channel_tier(channel: str) -> str:
     for name in _STUDIO_CHANNEL_NAMES:
         if _channel_tokens(name) <= tokens:
             return "studio"
+    for name in _MOVIE_CHANNEL_NAMES:
+        if _channel_tokens(name) <= tokens:
+            return "movie_official"
     return ""
 
 
@@ -642,7 +663,9 @@ _PIRACY_RE = re.compile(
     r"kutty\s*movies?|madras\s*rockers?|1\s*tamil\s*mv|tamil\s*gun|"
     r"filmy\s*zones?|hd\s*facts|filmy\s*wap|9x\s*movies?|hi\s*movies?|"
     r"movi[ez]+\s*zones?|movie\s*hubs?|world\s*free\s*4\s*u|bolly\s*4\s*u|"
-    r"veedigital|mtalkies?)\b",
+    r"veedigital|mtalkies?|"
+    r"new\s*south\s*movies?|south\s*(?:indian\s*)?movies?\s*(?:in\s+)?hindi|"
+    r"hindi\s*south\s*movies?|full\s*movies?\s*in\s+hindi)\b",
     re.IGNORECASE,
 )
 
@@ -650,7 +673,16 @@ _PIRACY_RE = re.compile(
 def _looks_pirated(channel: str, title: str) -> bool:
     """True when a channel or video title brands itself as a pirated upload."""
     blob = " | ".join(p for p in (channel or "", title or "") if p)
-    return bool(_PIRACY_RE.search(blob))
+    return bool(_PIRACY_RE.search(blob)) or _looks_like_dub_channel(channel)
+
+
+def _looks_like_dub_channel(channel: str) -> bool:
+    """True when a channel names itself '<word> Soft' (Hindi-dub re-upload).
+
+    Channels like "Facti Soft" re-upload (often mislabeled) regional films with
+    interview-style titles; the '<word> Soft' naming is characteristic of them.
+    """
+    return bool(channel and re.search(r"\b\w+\s+soft\b", channel, re.IGNORECASE))
 
 
 def _omdb_runtime_minutes(details: dict) -> int:
@@ -660,9 +692,38 @@ def _omdb_runtime_minutes(details: dict) -> int:
     return int(m.group(1)) if m else 0
 
 
+def _omdb_original_lang(details: dict) -> str:
+    """OMDb movie 'Language' field ("Tamil, Hindi") -> ISO of the primary language.
+
+    Returns '' when no listed language is one the app can verify against (e.g.
+    only "Marathi"), so the caller falls back to no language enforcement.
+    """
+    lang_field = str((details or {}).get("Language") or "")
+    for token in re.split(r"[,\s]+", lang_field):
+        token = token.strip().lower()
+        for word, (iso, _marker) in _LANGUAGE_HINTS.items():
+            if token == word:
+                return iso
+    return ""
+
+
+# Full-movie results are restricted to these channel tiers ("trusted").
+_TRUSTED_TIERS = ("tv", "studio", "movie_official")
+
+# Ranking bonus for trusted channel tiers (module-level, shared by every
+# YouTube flow).
+_TIER_BONUS = {"tv": 300, "studio": 150, "movie_official": 150}
+
+# Set True to also keep strictly-verified uploads from NON-trusted channels
+# (title matches exactly + passes the language/duration checks). Default False =
+# "trusted channels only".
+_ALLOW_UNTRUSTED_VERIFIED = False
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def youtube_full_movie(
-    title: str, year: str = "", media_type: str = "", lang: str = "", expected_minutes: int = 0
+    title: str, year: str = "", media_type: str = "", lang: str = "",
+    expected_minutes: int = 0, strict_lang: bool = False,
 ) -> list:
     """Find YouTube uploads that are actually full movies / full episodes.
 
@@ -672,7 +733,11 @@ def youtube_full_movie(
     also title-filtered). Results are ranked by title+year match (top 3). A
     language hint (e.g. 'ta') biases the search and boosts matching titles.
     When `expected_minutes` is given (movie runtime from OMDb), uploads whose
-    duration deviates >15% are flagged and ranked below matching-length ones.
+    duration deviates beyond a strict per-tier band are dropped. `lang` is the
+    effective language (user's hint, else the movie's original language when no
+    hint was given); with `strict_lang=True` the upload must also name that
+    language. Full-movie results come from trusted channels only (official TV,
+    studio, or curated movie channels) unless _ALLOW_UNTRUSTED_VERIFIED is set.
     """
     if not YOUTUBE_API_KEY:
         return []
@@ -770,20 +835,23 @@ def youtube_full_movie(
                     continue
                 if _other_lang_audio(video_title, lang):
                     continue
-                if not _confirm_lang(video_title, audio, lang):
+                if strict_lang and not _confirm_lang(video_title, audio, lang):
                     continue
             thumb = snippet.get("thumbnails", {}).get("medium", {}).get("url", "") or ""
             duration = durations[vid]
-            mismatch = (
-                expected_minutes > 0
-                and abs(duration - expected_minutes) > 0.15 * expected_minutes
+            tier = _channel_tier(channel)
+            tolerance = (
+                max(8, round(0.10 * expected_minutes))
+                if expected_minutes > 0 and tier == "tv"
+                else max(3, round(0.04 * expected_minutes))
             )
+            mismatch = expected_minutes > 0 and abs(duration - expected_minutes) > tolerance
             picked.append(
                 {
                     "video_id": vid,
                     "title": video_title,
                     "channel": channel,
-                    "official_tier": _channel_tier(channel),
+                    "official_tier": tier,
                     "duration": duration,
                     "audio_lang": audio,
                     "thumbnail": thumb,
@@ -797,24 +865,35 @@ def youtube_full_movie(
     if lang and not results:
         results = _collect(f"{title} {year} {marker} {keyword}")
 
-    # Drop unrelated AND pirated uploads. Only results whose title genuinely IS
-    # the queried movie (stand-alone name after removing upload markers like
-    # "full movie / tamil / hd / cast buckets") pass — a "Aanandham Aarambam"
-    # upload must never appear for an "Aanandham" query. Official TV channels
+    # Drop unrelated, pirated AND untrusted uploads. The channel must be on a
+    # trusted tier (official TV / studio / curated movie channels); only those
+    # may supply full movies. A trusted channel still needs the video to
+    # genuinely name the queried movie — except official TV channels, which
     # keep a trust exemption. Pirate-branded uploads (Filmy Zone, Hd Facts,
-    # TamilRockers, ...) are rejected outright even when the title matches.
+    # TamilRockers, "<name> Soft", "South Movie" buckets, ...) are rejected
+    # outright even when the title matches. Set _ALLOW_UNTRUSTED_VERIFIED = True
+    # to readmit strictly-verified (title-exact) uploads from other channels.
     results = [
         r for r in results
         if not _looks_pirated(r["channel"], r["title"])
-        and (r["official_tier"] == "tv" or _yt_title_exact_match(r["title"], title))
+        and (
+            (
+                r["official_tier"] in _TRUSTED_TIERS
+                and (r["official_tier"] == "tv" or _yt_title_exact_match(r["title"], title))
+            )
+            or (
+                _ALLOW_UNTRUSTED_VERIFIED
+                and r["official_tier"] not in _TRUSTED_TIERS
+                and _yt_title_exact_match(r["title"], title)
+            )
+        )
     ]
 
-    # Drop movies whose duration doesn't match the OMDb runtime (>15% off).
+    # Drop movies whose duration doesn't match the OMDb runtime (strict band).
     # Only set when an OMDb runtime exists, so this never affects TV series
     # or movies with no reference runtime.
     results = [r for r in results if not r.get("duration_mismatch")]
 
-    _TIER_BONUS = {"tv": 300, "studio": 150}
     results.sort(
         key=lambda r: (
             _yt_relevance_score(r["title"], title, year)
@@ -1071,7 +1150,7 @@ def youtube_series_playlists(
                 _yt_relevance_score(playlist_title, title, year)
                 + min(item_count, 60)
                 + (60 if marker and marker in lower_title else 0)
-                + {"tv": 300, "studio": 150}.get(tier, 0)
+                + _TIER_BONUS.get(tier, 0)
             )
             results.append(
                 {
@@ -1117,7 +1196,7 @@ def youtube_series_playlists(
                         _yt_relevance_score(r["title"], title, year)
                         + min(r["item_count"], 60)
                         + (60 if marker and marker in r["title"].lower() else 0)
-                        + {"tv": 300, "studio": 150}.get(r.get("official_tier", ""), 0)
+                        + {"tv": 300, "studio": 150, "movie_official": 150}.get(r.get("official_tier", ""), 0)
                         + (30 if lang in v else 0)
                     )
                     kept.append(r)
@@ -1263,7 +1342,7 @@ def youtube_series_episodes(
             tier = _channel_tier(channel)
             score = (
                 _yt_relevance_score(video_title, title, year)
-                + {"tv": 300, "studio": 150}.get(tier, 0)
+                + {"tv": 300, "studio": 150, "movie_official": 150}.get(tier, 0)
                 + (30 if marker and marker in lower_title else 0)
             )
             results.append(
@@ -1874,13 +1953,22 @@ def _render_result_cards(items: list):
                 st.session_state["providers"] = get_providers(item)
                 details = omdb_details(item)
                 st.session_state["details"] = details
-                lang = st.session_state.get("yt_lang") or ""
+                user_lang = st.session_state.get("yt_lang") or ""
                 if item["media_type"] == "movie":
+                    orig_lang = _omdb_original_lang(details)
+                    eff_lang = user_lang or orig_lang
+                    if user_lang or not orig_lang:
+                        st.session_state.pop("yt_auto_lang", None)
+                    else:
+                        st.session_state["yt_auto_lang"] = next(
+                            (k for k, (iso, _m) in _LANGUAGE_HINTS.items() if iso == orig_lang), ""
+                        )
                     st.session_state["yt_results"] = youtube_full_movie(
-                        item["title"], item.get("year") or "", item["media_type"], lang,
-                        _omdb_runtime_minutes(details) or 0,
+                        item["title"], item.get("year") or "", item["media_type"], eff_lang,
+                        _omdb_runtime_minutes(details) or 0, bool(user_lang),
                     )
                 else:
+                    st.session_state.pop("yt_auto_lang", None)
                     st.session_state.pop("yt_results", None)
 
 
@@ -2033,6 +2121,8 @@ def main():
                 (k for k, (iso, m) in _LANGUAGE_HINTS.items() if iso == yt_lang), ""
             )
             lang_note = f" · {lang_name.title()} prioritized" if lang_name else ""
+            auto_name = st.session_state.get("yt_auto_lang") or ""
+            auto_note = f" · Original language ({auto_name.title()}) prioritized" if auto_name else ""
             if is_series:
                 st.subheader("Full Series on YouTube")
                 if yt_results:
@@ -2052,7 +2142,8 @@ def main():
                         with ycols[1]:
                             al = r.get("audio_lang") or ""
                             audio_chip = f" · {_escape(al)} audio" if al else ""
-                            tier_tag = {"tv": " · Official TV", "studio": " · Official"}.get(
+                            tier_tag = {"tv": " · Official TV", "studio": " · Official",
+                                        "movie_official": " · Official"}.get(
                                 r.get("official_tier", ""), ""
                             )
                             st.markdown(
@@ -2075,7 +2166,7 @@ def main():
             else:
                 st.subheader("Full Movie on YouTube")
                 if yt_results:
-                    st.caption(f"Verified uploads only (full-length, official channels prioritized). Pick one and play.{lang_note}")
+                    st.caption(f"Trusted channels only — full-length, verified uploads.{lang_note}{auto_note} Pick one and play.")
                     for r in yt_results:
                         ycols = st.columns([1, 3, 1])
                         with ycols[0]:
@@ -2092,7 +2183,8 @@ def main():
                             al = r.get("audio_lang") or ""
                             aw = _LANG_BY_ISO.get(al, "") or al
                             audio_chip = f" · {_escape(aw)} audio" if aw else ""
-                            tier_tag = {"tv": " · Official TV", "studio": " · Official"}.get(
+                            tier_tag = {"tv": " · Official TV", "studio": " · Official",
+                                "movie_official": " · Official"}.get(
                                 r.get("official_tier", ""), ""
                             )
                             st.markdown(
@@ -2110,7 +2202,7 @@ def main():
                     st.info(
                         f"No {lang_name.title()} version found on YouTube right now."
                         if lang_name
-                        else "No verified full movie for this title on YouTube right now."
+                        else "No trusted & verified full movie for this title on YouTube right now."
                     )
 
         st.divider()
