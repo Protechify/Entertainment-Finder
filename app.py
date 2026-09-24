@@ -633,6 +633,26 @@ def _looks_like_reaction(channel: str, title: str, description: str = "") -> boo
     return bool(_REACTION_RE.search(blob))
 
 
+# Pirate uploaders self-identify ("Filmy Zone", "Hd Facts", "TamilRockers",
+# "TamilYogi", "Isaimini", ...) in their channel name or video title. Words are
+# space-agnostic ("Filmy Zone"/"FilmyZone", "Hd Facts"/"HDFacts") so both
+# formats are caught; \b keeps substrings of legit words from matching.
+_PIRACY_RE = re.compile(
+    r"\b(?:tamil\s*rockers?|tamil\s*yog[yi]|tamilyogi|isaimini|"
+    r"kutty\s*movies?|madras\s*rockers?|1\s*tamil\s*mv|tamil\s*gun|"
+    r"filmy\s*zones?|hd\s*facts|filmy\s*wap|9x\s*movies?|hi\s*movies?|"
+    r"movi[ez]+\s*zones?|movie\s*hubs?|world\s*free\s*4\s*u|bolly\s*4\s*u|"
+    r"veedigital|mtalkies?)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_pirated(channel: str, title: str) -> bool:
+    """True when a channel or video title brands itself as a pirated upload."""
+    blob = " | ".join(p for p in (channel or "", title or "") if p)
+    return bool(_PIRACY_RE.search(blob))
+
+
 def _omdb_runtime_minutes(details: dict) -> int:
     """OMDb movie 'Runtime' ("110 min") -> total minutes; 0 if missing/invalid."""
     runtime = str((details or {}).get("Runtime") or "")
@@ -777,13 +797,16 @@ def youtube_full_movie(
     if lang and not results:
         results = _collect(f"{title} {year} {marker} {keyword}")
 
-    # Drop unrelated uploads. Only results whose title genuinely IS the queried
-# movie (stand-alone name after removing upload markers like "full movie /
-# tamil / hd / cast buckets") pass — a "Aanandham Aarambam" upload must never
-# appear for an "Aanandham" query. Official TV channels keep a trust exemption.
+    # Drop unrelated AND pirated uploads. Only results whose title genuinely IS
+    # the queried movie (stand-alone name after removing upload markers like
+    # "full movie / tamil / hd / cast buckets") pass — a "Aanandham Aarambam"
+    # upload must never appear for an "Aanandham" query. Official TV channels
+    # keep a trust exemption. Pirate-branded uploads (Filmy Zone, Hd Facts,
+    # TamilRockers, ...) are rejected outright even when the title matches.
     results = [
         r for r in results
-        if r["official_tier"] == "tv" or _yt_title_exact_match(r["title"], title)
+        if not _looks_pirated(r["channel"], r["title"])
+        and (r["official_tier"] == "tv" or _yt_title_exact_match(r["title"], title))
     ]
 
     # Drop movies whose duration doesn't match the OMDb runtime (>15% off).
@@ -1427,12 +1450,20 @@ def _fuzzy_same_movie(a: dict, b: dict) -> bool:
     b_year = str(b.get("year") or "").strip()
     if a_year.isdigit() and b_year.isdigit() and abs(int(a_year) - int(b_year)) > 1:
         return False
-    a_tokens = _token_set(a.get("title") or "")
-    b_tokens = _token_set(b.get("title") or "")
+    a_title = a.get("title") or ""
+    b_title = b.get("title") or ""
+    a_tokens = _token_set(a_title)
+    b_tokens = _token_set(b_title)
     if not a_tokens or not b_tokens:
         return False
     overlap = len(a_tokens & b_tokens) / max(len(a_tokens), len(b_tokens))
-    return overlap >= 0.6
+    if overlap >= 0.6:
+        return True
+    # Spelling-variant listings ("Modha Rathiri" vs "Modha Rathri") share fewer
+    # than 60% of their words, so token overlap misses them. Char-level
+    # similarity catches them while keeping genuinely different films apart
+    # (year clash already returned False above).
+    return _fuzzy_score(a_title, b_title) >= 0.8
 
 
 def _dedup_key(item: dict) -> tuple:
@@ -1583,6 +1614,8 @@ def fuzzy_suggest(query: str, limit: int = 3) -> list:
             for item in items:
                 key = _dedup_key(item)
                 if any(_dedup_key(k) == key for k in pool):
+                    continue
+                if any(_fuzzy_same_movie(item, k) for k in pool):
                     continue
                 if media_hint and item["media_type"] != media_hint:
                     continue
