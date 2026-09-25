@@ -1,22 +1,21 @@
 import concurrent.futures
 import difflib
+import json
 import httpx
 import os
 import re
+from pathlib import Path
 import streamlit as st
 from simplejustwatchapi import exceptions as jw_exceptions
 from simplejustwatchapi import offers_for_countries, search as jw_search
 
-# Personal OMDb API key (server-side only, never sent to the browser).
-# Read from the environment so the key never sits in the repo; the hardcoded
-# value is only a local-development fallback.
-OMDB_API_KEY = os.environ.get("OMDB_API_KEY", "a97d6284")
-OMDB_BASE = "http://www.omdbapi.com/"
+OMDB_BASE = "https://www.omdbapi.com/"
 
 # YouTube Data API v3 (server-side only). Read from the environment so the key
 # never sits in the repo; empty string disables the YouTube full-movie section.
 YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
 YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
+YOUTUBE_RUNTIME_TOLERANCE = 0.10
 
 
 def _load_dotenv(path: str = ".env") -> None:
@@ -51,6 +50,85 @@ def _secret(name: str) -> str:
 
 
 YOUTUBE_API_KEY = _secret("YOUTUBE_API_KEY")
+OMDB_API_KEY = _secret("OMDB_API_KEY")
+CHANNEL_AUDIT_PATH = str(Path(__file__).with_name("channel_audit.json"))
+
+
+def _load_channel_audit(path: str = CHANNEL_AUDIT_PATH) -> dict:
+    try:
+        with open(path, encoding="utf-8") as audit_file:
+            data = json.load(audit_file)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _channel_audit_is_valid(data: dict) -> bool:
+    if type(data.get("schema_version")) is not int or data.get("schema_version") != 1:
+        return False
+    policy = data.get("policy")
+    if not isinstance(policy, dict):
+        return False
+    if policy.get("literal_title_match") is not True:
+        return False
+    try:
+        tolerance = float(policy.get("runtime_tolerance"))
+    except (TypeError, ValueError):
+        return False
+    if abs(tolerance - YOUTUBE_RUNTIME_TOLERANCE) > 1e-9:
+        return False
+    channels = data.get("channels")
+    if not isinstance(channels, dict):
+        return False
+    if any(
+        not isinstance(channel_id, str)
+        or not channel_id.startswith("UC")
+        or len(channel_id) < 10
+        or not isinstance(record, dict)
+        or record.get("channel_id") != channel_id
+        for channel_id, record in channels.items()
+    ):
+        return False
+    if any(
+        record.get("tier") not in {"tv", "studio", "movie_official"}
+        for record in channels.values()
+    ):
+        return False
+    if data.get("enforced") is True:
+        if not channels or data.get("review_required") is not False:
+            return False
+        errors = data.get("errors", [])
+        unresolved = data.get("unresolved", [])
+        waived = data.get("waived", [])
+        if not isinstance(errors, list) or errors:
+            return False
+        if not isinstance(unresolved, list) or not isinstance(waived, list):
+            return False
+        waived_keys = {" ".join(str(item).split()).casefold() for item in waived}
+        for item in unresolved:
+            if not isinstance(item, dict) or " ".join(
+                str(item.get("name") or "").split()
+            ).casefold() not in waived_keys:
+                return False
+        for record in channels.values():
+            if (
+                record.get("status") != "qualified"
+                or record.get("reviewed") is not True
+                or not str(record.get("official_source") or "").strip()
+            ):
+                return False
+    return True
+
+
+_CHANNEL_AUDIT = _load_channel_audit()
+_CHANNEL_AUDIT_VALID = _channel_audit_is_valid(_CHANNEL_AUDIT)
+_CHANNEL_AUDIT_ENFORCED = _CHANNEL_AUDIT_VALID and _CHANNEL_AUDIT.get("enforced") is True
+_CHANNEL_AUDIT_CHANNELS = _CHANNEL_AUDIT.get("channels", {})
+if not _CHANNEL_AUDIT_VALID or not isinstance(_CHANNEL_AUDIT_CHANNELS, dict):
+    _CHANNEL_AUDIT_CHANNELS = {}
+_CHANNEL_AUDIT_VERSION = str(
+    _CHANNEL_AUDIT.get("generated_at") if _CHANNEL_AUDIT_VALID else "legacy"
+) or "legacy"
 
 COUNTRY = "IN"
 LANGUAGE = "en"
@@ -359,7 +437,7 @@ _OFFICIAL_MOVIE_CHANNELS = {
            "20th Century Studios"},
     "hi": {"Shemaroo", "Rajshri", "T-Series", "Goldmines",
            "Goldmines Telefilms", "Goldmines Hindi"},
-    "ta": {"Sun Pictures", "Sun NXT", "Zee Studios", "AVM Productions"},
+    "ta": {"Sun Pictures", "Sun NXT", "Zee Studios", "AVM Productions", "Sony VIZHA"},
 }
 
 # Flattened whitelist names (shared across languages).
@@ -626,6 +704,12 @@ def _youtube_duration_minutes(iso: str) -> int:
     return d * 1440 + h * 60 + min_ + (1 if s >= 30 else 0)
 
 
+def _youtube_runtime_matches(duration: int, expected_minutes: int) -> bool:
+    if expected_minutes <= 0:
+        return False
+    return abs(duration - expected_minutes) <= expected_minutes * YOUTUBE_RUNTIME_TOLERANCE
+
+
 _YOUTUBE_BAD_WORDS = (
     "trailer", "teaser", "review", "explained", "recap", "reaction", "music video"
 )
@@ -710,6 +794,17 @@ def _omdb_original_lang(details: dict) -> str:
 # Full-movie results are restricted to these channel tiers ("trusted").
 _TRUSTED_TIERS = ("tv", "studio", "movie_official")
 
+
+def _channel_tier_for_video(channel: str, channel_id: str) -> str:
+    if not _CHANNEL_AUDIT_ENFORCED:
+        return _channel_tier(channel)
+    record = _CHANNEL_AUDIT_CHANNELS.get(channel_id)
+    if not isinstance(record, dict) or record.get("status") != "qualified":
+        return ""
+    tier = record.get("tier") or ""
+    return tier if isinstance(tier, str) and tier in _TRUSTED_TIERS else ""
+
+
 # Ranking bonus for trusted channel tiers (module-level, shared by every
 # YouTube flow).
 _TIER_BONUS = {"tv": 300, "studio": 150, "movie_official": 150}
@@ -724,6 +819,7 @@ _ALLOW_UNTRUSTED_VERIFIED = False
 def youtube_full_movie(
     title: str, year: str = "", media_type: str = "", lang: str = "",
     expected_minutes: int = 0, strict_lang: bool = False,
+    audit_version: str = "",
 ) -> list:
     """Find YouTube uploads that are actually full movies / full episodes.
 
@@ -733,11 +829,11 @@ def youtube_full_movie(
     also title-filtered). Results are ranked by title+year match (top 3). A
     language hint (e.g. 'ta') biases the search and boosts matching titles.
     When `expected_minutes` is given (movie runtime from OMDb), uploads whose
-    duration deviates beyond a strict per-tier band are dropped. `lang` is the
-    effective language (user's hint, else the movie's original language when no
-    hint was given); with `strict_lang=True` the upload must also name that
-    language. Full-movie results come from trusted channels only (official TV,
-    studio, or curated movie channels) unless _ALLOW_UNTRUSTED_VERIFIED is set.
+    duration deviates by more than 10% are dropped. `lang` is the effective
+    language (user's hint, else the movie's original language when no hint was
+    given); with `strict_lang=True` the upload must also name that language.
+    Full-movie results come from trusted channels only (official TV, studio, or
+    curated movie channels) unless _ALLOW_UNTRUSTED_VERIFIED is set.
     """
     if not YOUTUBE_API_KEY:
         return []
@@ -823,6 +919,7 @@ def youtube_full_movie(
                 continue
             video_title = _html.unescape(snippet.get("title") or "")
             channel = _html.unescape(snippet.get("channelTitle") or "")
+            channel_id = snippet.get("channelId", "") or ""
             if any(word in video_title.lower() for word in _YOUTUBE_BAD_WORDS):
                 continue
             # Reaction uploads retitle videos to look like the real film, so the
@@ -839,18 +936,14 @@ def youtube_full_movie(
                     continue
             thumb = snippet.get("thumbnails", {}).get("medium", {}).get("url", "") or ""
             duration = durations[vid]
-            tier = _channel_tier(channel)
-            tolerance = (
-                max(8, round(0.10 * expected_minutes))
-                if expected_minutes > 0 and tier == "tv"
-                else max(3, round(0.04 * expected_minutes))
-            )
-            mismatch = expected_minutes > 0 and abs(duration - expected_minutes) > tolerance
+            tier = _channel_tier_for_video(channel, channel_id)
+            mismatch = not _youtube_runtime_matches(duration, expected_minutes)
             picked.append(
                 {
                     "video_id": vid,
                     "title": video_title,
                     "channel": channel,
+                    "channel_id": channel_id,
                     "official_tier": tier,
                     "duration": duration,
                     "audio_lang": audio,
@@ -867,19 +960,16 @@ def youtube_full_movie(
 
     # Drop unrelated, pirated AND untrusted uploads. The channel must be on a
     # trusted tier (official TV / studio / curated movie channels); only those
-    # may supply full movies. A trusted channel still needs the video to
-    # genuinely name the queried movie — except official TV channels, which
-    # keep a trust exemption. Pirate-branded uploads (Filmy Zone, Hd Facts,
-    # TamilRockers, "<name> Soft", "South Movie" buckets, ...) are rejected
-    # outright even when the title matches. Set _ALLOW_UNTRUSTED_VERIFIED = True
-    # to readmit strictly-verified (title-exact) uploads from other channels.
+    # may supply full movies. Every trusted result must name the queried movie
+    # literally. Pirate-branded uploads are rejected outright even when the
+    # title matches.
     results = [
         r for r in results
         if not _looks_pirated(r["channel"], r["title"])
         and (
             (
                 r["official_tier"] in _TRUSTED_TIERS
-                and (r["official_tier"] == "tv" or _yt_title_exact_match(r["title"], title))
+                and _yt_title_exact_match(r["title"], title)
             )
             or (
                 _ALLOW_UNTRUSTED_VERIFIED
@@ -889,9 +979,8 @@ def youtube_full_movie(
         )
     ]
 
-    # Drop movies whose duration doesn't match the OMDb runtime (strict band).
-    # Only set when an OMDb runtime exists, so this never affects TV series
-    # or movies with no reference runtime.
+    # Drop movies whose duration differs from OMDb by more than 10%; a missing
+    # reference runtime is treated as unverifiable.
     results = [r for r in results if not r.get("duration_mismatch")]
 
     results.sort(
@@ -1056,7 +1145,8 @@ def _playlist_is_full_episodes(playlist_id: str) -> bool:
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def youtube_series_playlists(
-    title: str, year: str = "", lang: str = "", expected_episodes: int = 0
+    title: str, year: str = "", lang: str = "", expected_episodes: int = 0,
+    audit_version: str = "",
 ) -> list:
     """Find full-series playlists on YouTube for a TV series.
 
@@ -1141,11 +1231,12 @@ def youtube_series_playlists(
             thumb = snippet.get("thumbnails", {}).get("medium", {}).get("url", "") or ""
             item_count = counts[pid]
             channel = _html.unescape(snippet.get("channelTitle") or "")
+            channel_id = snippet.get("channelId", "") or ""
             # Reaction channels build "watch the whole series" playlists too —
             # drop them using channel + title + description signals.
             if _looks_like_reaction(channel, playlist_title, snippet.get("description") or ""):
                 continue
-            tier = _channel_tier(channel)
+            tier = _channel_tier_for_video(channel, channel_id)
             score = (
                 _yt_relevance_score(playlist_title, title, year)
                 + min(item_count, 60)
@@ -1157,6 +1248,7 @@ def youtube_series_playlists(
                     "playlist_id": pid,
                     "title": playlist_title,
                     "channel": channel,
+                    "channel_id": channel_id,
                     "official_tier": tier,
                     "item_count": item_count,
                     "thumbnail": thumb,
@@ -1224,7 +1316,8 @@ _YT_EPISODE_RE = re.compile(
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def youtube_series_episodes(
-    title: str, year: str = "", lang: str = "", season: int = 0
+    title: str, year: str = "", lang: str = "", season: int = 0,
+    audit_version: str = "",
 ) -> list:
     """Find individual full-episode uploads for a TV series / anime.
 
@@ -1307,6 +1400,7 @@ def youtube_series_episodes(
                 continue
             video_title = _html.unescape(snippet.get("title") or "")
             channel = _html.unescape(snippet.get("channelTitle") or "")
+            channel_id = snippet.get("channelId", "") or ""
             lower_title = video_title.lower()
             if any(word in lower_title for word in _YOUTUBE_BAD_WORDS):
                 continue
@@ -1339,7 +1433,7 @@ def youtube_series_episodes(
                 if not _confirm_lang(video_title, audio, lang):
                     continue
             thumb = snippet.get("thumbnails", {}).get("medium", {}).get("url", "") or ""
-            tier = _channel_tier(channel)
+            tier = _channel_tier_for_video(channel, channel_id)
             score = (
                 _yt_relevance_score(video_title, title, year)
                 + {"tv": 300, "studio": 150, "movie_official": 150}.get(tier, 0)
@@ -1350,6 +1444,7 @@ def youtube_series_episodes(
                     "video_id": vid,
                     "title": video_title,
                     "channel": channel,
+                    "channel_id": channel_id,
                     "official_tier": tier,
                     "duration": durations[vid],
                     "audio_lang": audio,
@@ -1966,6 +2061,7 @@ def _render_result_cards(items: list):
                     st.session_state["yt_results"] = youtube_full_movie(
                         item["title"], item.get("year") or "", item["media_type"], eff_lang,
                         _omdb_runtime_minutes(details) or 0, bool(user_lang),
+                        _CHANNEL_AUDIT_VERSION,
                     )
                 else:
                     st.session_state.pop("yt_auto_lang", None)

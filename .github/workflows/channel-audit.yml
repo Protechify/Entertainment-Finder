@@ -1,0 +1,56 @@
+name: Channel audit
+
+on:
+  schedule:
+    - cron: "17 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: channel-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run policy tests
+        run: python -m unittest discover -s tests -v
+      - name: Require the default branch
+        run: test "$(git branch --show-current)" = "main"
+      - name: Audit trusted channels
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          OMDB_API_KEY: ${{ secrets.OMDB_API_KEY }}
+        run: python channel_audit.py --output channel_audit.json --max-pages 20 --max-omdb-lookups 900
+      - name: Upload audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: channel-audit-report
+          path: channel_audit.json
+      - name: Commit reviewed report
+        run: |
+          if ! python -c "import json, sys; sys.exit(0 if json.load(open('channel_audit.json', encoding='utf-8')).get('enforced') else 1)"; then
+            echo "Audit report requires review; leaving the committed report unchanged."
+            exit 0
+          fi
+          if [ -z "$(git status --short -- channel_audit.json)" ]; then
+            echo "Audit report is unchanged."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add channel_audit.json
+          git commit -m "chore: refresh channel audit"
+          git push
