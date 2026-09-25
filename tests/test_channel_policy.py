@@ -16,6 +16,81 @@ class ChannelPolicyTests(unittest.TestCase):
         self.assertFalse(app._youtube_runtime_matches(156, 174))
         self.assertFalse(app._youtube_runtime_matches(120, 0))
 
+    def test_omdb_status_requires_runtime_configuration(self):
+        with patch.object(app, "OMDB_API_KEY", ""):
+            self.assertEqual(app._omdb_status({}), "not_configured")
+        with patch.object(app, "OMDB_API_KEY", "omdb-key"):
+            self.assertEqual(app._omdb_status({}), "unavailable")
+            self.assertEqual(app._omdb_status({"Runtime": "N/A"}), "runtime_missing")
+            self.assertEqual(app._omdb_status({"Runtime": "174 min"}), "ready")
+
+    def test_bachelor_runtime_verified_youtube_result(self):
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def json(self):
+                return self.payload
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+            def get(self, url, params):
+                if url == app.YOUTUBE_SEARCH_URL:
+                    return FakeResponse({
+                        "items": [{
+                            "id": {"videoId": "LD08s4ONvJI"},
+                            "snippet": {
+                                "title": "Bachelor | Full Movie | GV Prakash Kumar",
+                                "channelTitle": "Sony VIZHA",
+                                "channelId": "UC-sony",
+                                "thumbnails": {},
+                            },
+                        }]
+                    })
+                if url == app.YOUTUBE_VIDEOS_URL:
+                    return FakeResponse({
+                        "items": [{
+                            "id": "LD08s4ONvJI",
+                            "snippet": {
+                                "title": "Bachelor | Full Movie | GV Prakash Kumar",
+                                "channelTitle": "Sony VIZHA",
+                                "channelId": "UC-sony",
+                                "defaultAudioLanguage": "ta",
+                                "description": "",
+                            },
+                            "contentDetails": {"duration": "PT2H38M"},
+                            "status": {
+                                "privacyStatus": "public",
+                                "embeddable": True,
+                                "uploadStatus": "processed",
+                            },
+                        }]
+                    })
+                raise AssertionError(f"Unexpected URL: {url}")
+
+        app.youtube_full_movie.clear()
+        with (
+            patch.object(app, "YOUTUBE_API_KEY", "youtube-key"),
+            patch.object(app.httpx, "Client", FakeClient),
+        ):
+            verified = app.youtube_full_movie(
+                "Bachelor", "2021", "movie", "ta", 174, True, "bachelor-test"
+            )
+            unverified = app.youtube_full_movie(
+                "Bachelor", "2021", "movie", "ta", 0, True, "bachelor-test-missing"
+            )
+        self.assertEqual(len(verified), 1)
+        self.assertEqual(verified[0]["video_id"], "LD08s4ONvJI")
+        self.assertEqual(unverified, [])
+
     def test_channel_resolution_requires_seed_token_overlap(self):
         candidate = {"snippet": {"title": "Unrelated Movie Channel"}}
         self.assertEqual(channel_audit._candidate_score(candidate, "Zee Tamil"), 0)

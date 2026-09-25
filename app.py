@@ -776,6 +776,16 @@ def _omdb_runtime_minutes(details: dict) -> int:
     return int(m.group(1)) if m else 0
 
 
+def _omdb_status(details: dict) -> str:
+    if not OMDB_API_KEY:
+        return "not_configured"
+    if not details:
+        return "unavailable"
+    if _omdb_runtime_minutes(details) <= 0:
+        return "runtime_missing"
+    return "ready"
+
+
 def _omdb_original_lang(details: dict) -> str:
     """OMDb movie 'Language' field ("Tamil, Hindi") -> ISO of the primary language.
 
@@ -2048,6 +2058,8 @@ def _render_result_cards(items: list):
                 st.session_state["providers"] = get_providers(item)
                 details = omdb_details(item)
                 st.session_state["details"] = details
+                omdb_status = _omdb_status(details)
+                st.session_state["omdb_status"] = omdb_status
                 user_lang = st.session_state.get("yt_lang") or ""
                 if item["media_type"] == "movie":
                     orig_lang = _omdb_original_lang(details)
@@ -2058,11 +2070,14 @@ def _render_result_cards(items: list):
                         st.session_state["yt_auto_lang"] = next(
                             (k for k, (iso, _m) in _LANGUAGE_HINTS.items() if iso == orig_lang), ""
                         )
-                    st.session_state["yt_results"] = youtube_full_movie(
-                        item["title"], item.get("year") or "", item["media_type"], eff_lang,
-                        _omdb_runtime_minutes(details) or 0, bool(user_lang),
-                        _CHANNEL_AUDIT_VERSION,
-                    )
+                    if omdb_status == "ready":
+                        st.session_state["yt_results"] = youtube_full_movie(
+                            item["title"], item.get("year") or "", item["media_type"], eff_lang,
+                            _omdb_runtime_minutes(details), bool(user_lang),
+                            _CHANNEL_AUDIT_VERSION,
+                        )
+                    else:
+                        st.session_state["yt_results"] = []
                 else:
                     st.session_state.pop("yt_auto_lang", None)
                     st.session_state.pop("yt_results", None)
@@ -2149,8 +2164,19 @@ def main():
                 st.markdown(f"[View on IMDB]({selected['link']})")
 
         details = st.session_state.get("details")
+        omdb_status = st.session_state.get("omdb_status", "unavailable")
         if not details:
-            st.info("Couldn't load description & reviews for this title.")
+            if omdb_status == "not_configured":
+                st.warning(
+                    "OMDb is not configured, so runtime verification and title details are unavailable. "
+                    "Set OMDB_API_KEY and select the title again."
+                )
+            elif omdb_status == "runtime_missing":
+                st.warning(
+                    "OMDb returned no usable runtime, so YouTube runtime verification is unavailable."
+                )
+            else:
+                st.info("Couldn't load description & reviews for this title.")
         else:
             st.subheader("Description")
             plot = (details.get("Plot") or "").strip()
@@ -2295,11 +2321,17 @@ def main():
                                 type="primary",
                             )
                 else:
-                    st.info(
-                        f"No {lang_name.title()} version found on YouTube right now."
-                        if lang_name
-                        else "No trusted & verified full movie for this title on YouTube right now."
-                    )
+                    if omdb_status != "ready":
+                        st.warning(
+                            "YouTube verification is unavailable because OMDb runtime data could not be loaded. "
+                            "Configure OMDB_API_KEY and select the title again."
+                        )
+                    else:
+                        st.info(
+                            f"No {lang_name.title()} version found on YouTube right now."
+                            if lang_name
+                            else "No trusted & verified full movie for this title on YouTube right now."
+                        )
 
         st.divider()
         st.subheader("Watch for Free")
