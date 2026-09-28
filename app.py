@@ -5,11 +5,17 @@ import httpx
 import os
 import re
 from pathlib import Path
+from urllib.parse import quote
 import streamlit as st
 from simplejustwatchapi import exceptions as jw_exceptions
 from simplejustwatchapi import offers_for_countries, search as jw_search
 
 OMDB_BASE = "https://www.omdbapi.com/"
+
+# IMDb's public title-suggestion endpoint. Unofficial and undocumented, but it
+# needs no API key and is the one source that can find titles OMDb's own search
+# misses (see :func:`_imdb_suggest`).
+IMDB_SUGGEST_BASE = "https://v2.sg.media-imdb.com/suggestion/x/"
 
 # YouTube Data API v3 (server-side only). Read from the environment so the key
 # never sits in the repo; empty string disables the YouTube full-movie section.
@@ -17,9 +23,26 @@ YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
 YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
 YOUTUBE_RUNTIME_TOLERANCE = 0.10
 
+# How many alternate spellings a single title lookup may try. Each one is a
+# network round trip, so the list is kept short, is only reached when the
+# catalogues have already reported a miss, and the probes run concurrently.
+_TITLE_VARIANT_LIMIT = 4
 
-def _load_dotenv(path: str = ".env") -> None:
-    """Load KEY=VALUE pairs from a .env file into os.environ (no dependencies)."""
+
+# Anchor the .env to this file rather than the process's working directory:
+# Streamlit is routinely launched from a different folder, and a relative
+# lookup there leaves OMDB_API_KEY / YOUTUBE_API_KEY empty.
+DOTENV_PATH = str(Path(__file__).with_name(".env"))
+
+
+def _load_dotenv(path: str = DOTENV_PATH) -> None:
+    """Load KEY=VALUE pairs from a .env file into os.environ (no dependencies).
+
+    Defaults to the .env sitting next to this file, so keys resolve no matter
+    which directory Streamlit was launched from. A key already present in the
+    environment wins — but only when it actually holds a value, because an
+    empty `KEY=` in the shell would otherwise shadow the real .env entry.
+    """
     try:
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -29,7 +52,7 @@ def _load_dotenv(path: str = ".env") -> None:
                 key, _, value = line.partition("=")
                 key = key.strip()
                 value = value.strip().strip('"').strip("'")
-                if key and key not in os.environ:
+                if key and not os.environ.get(key):
                     os.environ[key] = value
     except OSError:
         pass
@@ -305,18 +328,69 @@ def _link_has_content(url: str, title: str, year: str = "", media_type: str = ""
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def _poster_ok(url: str) -> bool:
-    """True only if the URL actually serves an image (guards broken poster links)."""
+    """True only if the URL actually serves an image (guards broken poster links).
+
+    Only the declared content type matters, so the request asks for headers
+    alone: a HEAD, falling back to a single-byte ranged GET for the hosts that
+    refuse HEAD. Downloading whole posters in order to read a header made every
+    search pull down tens of megabytes of images it was about to discard, and
+    that transfer — not the catalogue lookups — is what the search was waiting
+    on. The cache keeps repeat searches from paying even the small request.
+    """
     if not _safe_url(url):
         return False
-    try:
-        with httpx.Client(timeout=8, follow_redirects=True) as client:
-            resp = client.get(url, headers=_BROWSER_HEADERS)
-    except httpx.HTTPError:
-        return False
-    if resp.status_code != 200:
-        return False
-    ctype = (resp.headers.get("content-type") or "").lower()
-    return ctype.startswith("image/")
+    attempts = (
+        ("head", _BROWSER_HEADERS),
+        ("get", {**_BROWSER_HEADERS, "Range": "bytes=0-0"}),
+    )
+    with httpx.Client(timeout=8, follow_redirects=True) as client:
+        for method, headers in attempts:
+            try:
+                resp = getattr(client, method)(url, headers=headers)
+            except httpx.HTTPError:
+                return False
+            if resp.status_code in (405, 501):
+                continue
+            if resp.status_code not in (200, 206):
+                return False
+            ctype = (resp.headers.get("content-type") or "").lower()
+            return ctype.startswith("image/")
+    return False
+
+
+def _verify_posters(rows: list) -> list:
+    """Confirm the posters on these rows really serve an image, in parallel.
+
+    A search turns up around twenty rows and each check is a network round
+    trip, so verifying them one after another is what decides how long a
+    search takes. Repairs are run in the same pool for the same reason: a
+    broken poster is replaced by asking the other provider for its artwork,
+    which is another round trip per row, and those are independent too. The
+    row order is left alone.
+    """
+    pending = [row for row in rows if row.get("poster")]
+    if not pending:
+        return rows
+
+    def _served(row: dict) -> bool:
+        try:
+            return _poster_ok(row["poster"])
+        except Exception:
+            return False
+
+    def _replacement(row: dict):
+        try:
+            return _fallback_poster(row["title"], row.get("year") or "") or None
+        except Exception:
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(12, len(pending))
+    ) as ex:
+        broken = [row for row, ok in zip(pending, ex.map(_served, pending)) if not ok]
+        for row, poster in zip(broken, ex.map(_replacement, broken)):
+            row["poster"] = poster
+    return rows
 
 
 def _fallback_poster(title: str, title_year: str = "") -> str:
@@ -470,6 +544,17 @@ def _channel_tokens(name: str) -> frozenset:
     return cached
 
 
+# Words too generic to identify a channel on their own. "&TV" reduces to the
+# single token "tv", and a subset match then badged any channel with "TV" in
+# its name — an aggregator called "Crazy Toon TV" was labelled a broadcaster.
+# A whitelist name made only of these is skipped; real names such as "Jaya TV"
+# and "Shemaroo" keep matching.
+_GENERIC_CHANNEL_TOKENS = frozenset({
+    "tv", "movies", "movie", "film", "films", "official", "channel", "media",
+    "entertainment", "hd", "4k", "plus", "cinema", "video", "videos", "world",
+})
+
+
 def _channel_tier(channel: str) -> str:
     """Classify a YouTube channel title as 'tv', 'studio', or '' (other).
 
@@ -481,15 +566,17 @@ def _channel_tier(channel: str) -> str:
     tokens = _channel_tokens(channel)
     if not tokens:
         return ""
-    for name in _TV_CHANNEL_NAMES:
-        if _channel_tokens(name) <= tokens:
-            return "tv"
-    for name in _STUDIO_CHANNEL_NAMES:
-        if _channel_tokens(name) <= tokens:
-            return "studio"
-    for name in _MOVIE_CHANNEL_NAMES:
-        if _channel_tokens(name) <= tokens:
-            return "movie_official"
+    for names, tier in (
+        (_TV_CHANNEL_NAMES, "tv"),
+        (_STUDIO_CHANNEL_NAMES, "studio"),
+        (_MOVIE_CHANNEL_NAMES, "movie_official"),
+    ):
+        for name in names:
+            name_tokens = _channel_tokens(name)
+            if not name_tokens or name_tokens <= _GENERIC_CHANNEL_TOKENS:
+                continue
+            if name_tokens <= tokens:
+                return tier
     return ""
 
 
@@ -590,52 +677,326 @@ def _confirm_lang(title: str, audio: str, lang: str) -> bool:
     return bool(marker and re.search(rf"\b{re.escape(marker)}\b", title.lower()))
 
 
+def _omdb_fetch(params: dict) -> tuple[dict, str]:
+    """Call the OMDb API and return (data, error).
+
+    OMDb reports failures with a non-2xx status (401 for a bad key or an
+    exhausted free quota, 404 for a missing title) but always sends a JSON body
+    whose "Error" field says why. httpx does not raise on those statuses, so the
+    body is still parsed here and the explanation is handed back to the caller
+    instead of being thrown away — that message is what makes a rate limit
+    distinguishable from an unconfigured key.
+
+    Returns ({}, reason) on any failure, where reason is OMDb's own "Error"
+    text, or a short label for transport problems.
+    """
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.get(OMDB_BASE, params=params)
+            data = resp.json()
+    except httpx.HTTPError:
+        return {}, "network error"
+    except ValueError:
+        return {}, "invalid response"
+    if not isinstance(data, dict):
+        return {}, "invalid response"
+    if data.get("Response") == "True":
+        return data, ""
+    return {}, str(data.get("Error") or "request failed")
+
+
+def _omdb_search_type(query: str, media_type: str, label: str) -> list:
+    """Rows from one OMDb search call, poster verification included."""
+    rows = []
+    data, _error = _omdb_fetch(
+        {"s": query, "type": media_type, "apikey": OMDB_API_KEY}
+    )
+    for item in data.get("Search", []):
+        title = item.get("Title") or ""
+        if not title:
+            continue
+        poster = item.get("Poster") or ""
+        if poster in ("", "N/A"):
+            poster = None
+        imdb_id = item.get("imdbID")
+        rows.append(
+            {
+                "id": imdb_id,
+                "media_type": label,
+                "title": title,
+                "year": (item.get("Year") or "")[:4],
+                "poster": poster,
+                "link": f"https://www.imdb.com/title/{imdb_id}/" if imdb_id else "",
+            }
+        )
+    return _verify_posters(rows)
+
+
 def omdb_search(query: str, media_hint: str = "") -> list:
-    """Search OMDb for movies and TV series (optionally a single type)."""
-    results = []
+    """Search OMDb for movies and TV series (optionally a single type).
+
+    The movie and series searches are independent requests against a slow
+    endpoint — together around 2.5s in a row — so they are issued concurrently
+    rather than one after the other, which roughly halves the wait for an
+    unhinted search. Movies are still listed before series, because a title
+    most people search for is a film far more often than a series.
+    """
     if media_hint == "movie":
         types = (("movie", "movie"),)
     elif media_hint == "tv":
         types = (("series", "tv"),)
     else:
         types = (("movie", "movie"), ("series", "tv"))
-    for media_type, label in types:
-        try:
-            with httpx.Client(timeout=10) as client:
-                resp = client.get(
-                    OMDB_BASE,
-                    params={"s": query, "type": media_type, "apikey": OMDB_API_KEY},
-                )
-                data = resp.json()
-        except httpx.HTTPError:
-            continue
-        if data.get("Response") != "True":
-            continue
-        for item in data.get("Search", []):
-            title = item.get("Title") or ""
-            if not title:
+    if len(types) == 1:
+        return _omdb_search_type(query, *types[0])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(types)) as ex:
+        futures = [ex.submit(_omdb_search_type, query, mt, lb) for mt, lb in types]
+        results = []
+        for fut in futures:
+            try:
+                results.extend(fut.result(timeout=30))
+            except Exception:
                 continue
-            poster = item.get("Poster") or ""
-            if poster in ("", "N/A"):
-                poster = None
-            if poster and not _poster_ok(poster):
-                poster = _fallback_poster(title, (item.get("Year") or "")[:4]) or None
-            imdb_id = item.get("imdbID")
-            results.append(
-                {
-                    "id": imdb_id,
-                    "media_type": label,
-                    "title": title,
-                    "year": (item.get("Year") or "")[:4],
-                    "poster": poster,
-                    "link": f"https://www.imdb.com/title/{imdb_id}/" if imdb_id else "",
-                }
-            )
     return results
 
 
-def omdb_details(selected: dict) -> dict:
-    """Fetch full detail (plot, ratings, cast, etc.) from OMDb for a selected title."""
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def _imdb_suggest_cached(query: str) -> list:
+    """Ask IMDb for title suggestions matching `query`. Returns normalised rows.
+
+    The endpoint is unofficial, so every failure is swallowed and reported as
+    "no suggestions". A bridge outage must leave search exactly as it behaves
+    without this function, never turn into an error.
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.get(
+                IMDB_SUGGEST_BASE + f"{quote(query, safe='')}.json",
+                params={"includeVideos": "0"},
+                headers={"User-Agent": "EntertainmentFinder/1.0"},
+            )
+        data = resp.json()
+    except (httpx.HTTPError, ValueError, TypeError, OSError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    rows = []
+    for entry in data.get("d") or []:
+        if not isinstance(entry, dict):
+            continue
+        imdb_id = entry.get("id") or ""
+        kind = entry.get("qid") or entry.get("q") or ""
+        label = entry.get("l") or ""
+        if not imdb_id.startswith("tt") or kind not in ("movie", "series", "tvMovie", "short", "video"):
+            continue
+        if not label:
+            continue
+        rows.append(
+            {
+                "id": imdb_id,
+                "media_type": "tv" if kind == "series" else "movie",
+                "title": label,
+                "year": str(entry.get("y") or "")[:4],
+                "poster": None,
+                "link": f"https://www.imdb.com/title/{imdb_id}/",
+            }
+        )
+    return rows
+
+
+def _imdb_suggest(query: str) -> list:
+    """Cached, network-safe wrapper around :func:`_imdb_suggest_cached`.
+
+    Streamlit's cache is bypassed when it has not been initialised (in unit
+    tests, and before the first script run), so failures are also trapped here.
+    """
+    try:
+        return _imdb_suggest_cached(query)
+    except Exception:
+        return []
+
+
+def _title_variants(query: str) -> list:
+    """Plausible alternate spellings of a short title, for a second lookup pass.
+
+    Regional catalogues disagree on romanisation far more often than they
+    disagree on the film: the Ajith Kumar film is "Villain" everywhere except
+    on YouTube, where uploads are titled "Villan". Because a wrong catalogue
+    lookup returns an unrelated film rather than nothing, the extra guesses are
+    only ever used against sources that report a real miss.
+
+    The guesses are ranked rather than enumerated, because there are far more
+    single-vowel edits than the lookup is allowed to try and the naive order
+    spends its whole budget on the first letter of the word. Romanisation drift
+    in regional catalogues is overwhelmingly a vowel inserted next to another
+    vowel, or a vowel standing in for a neighbouring one, and it happens in the
+    second half of a name rather than at its start. So vowel edits are offered
+    from the end of the word backwards and only where a vowel actually sits, and
+    an edit at either extreme — prepending or appending a vowel — is left out,
+    since turning "villan" into "avillan" is not a variant of anything. That
+    ordering is what puts "villain" inside the budget for "villan".
+    """
+    core = "".join(
+        ch for ch in (query or "").lower() if ch.isalnum()
+    )
+    if len(core) < 4:
+        return []
+    ranked = []
+    # A vowel appearing between a vowel and a consonant: villan -> villain.
+    for index in range(1, len(core)):
+        if core[index - 1] in "aeiou" and core[index] not in "aeiou":
+            for rank, vowel in enumerate("aeiou"):
+                ranked.append((0, -index, rank, core[:index] + vowel + core[index:]))
+    for a, b in (("v", "w"), ("k", "c"), ("f", "ph"), ("s", "sh"), ("z", "s")):
+        if a in core:
+            ranked.append((1, 0, 0, core.replace(a, b)))
+    for a, b in (("w", "v"), ("c", "k"), ("s", "z")):
+        if b in core:
+            ranked.append((1, 0, 0, core.replace(b, a)))
+    for index in range(len(core) - 1, 0, -1):
+        if core[index] in "aeiou":
+            for rank, vowel in enumerate("aeiou"):
+                if vowel != core[index]:
+                    ranked.append((2, -index, rank, core[:index] + vowel + core[index + 1:]))
+    for index in range(len(core) - 1, 0, -1):
+        if core[index] in "aeiou":
+            ranked.append((3, -index, 0, core[:index] + core[index + 1:]))
+    for index in range(len(core) - 1, 0, -1):
+        if index and core[index] == core[index - 1]:
+            ranked.append((4, -index, 0, core[:index] + core[index + 1:]))
+    ranked.sort()
+    seen = {core, (query or "").strip().lower()}
+    variants = []
+    for _category, _position, _rank, candidate in ranked:
+        if candidate in seen or len(candidate) < 4:
+            continue
+        seen.add(candidate)
+        variants.append(candidate)
+    return variants[:_TITLE_VARIANT_LIMIT]
+
+
+def _imdb_candidate_is_the_film(
+    candidate: dict, title: str, year: str = "", media_type: str = ""
+) -> bool:
+    """Decide whether an IMDb suggestion really is the film being looked for.
+
+    IMDb suggestions are matched on the name alone, so a bare "Villain" comes
+    back as a 1971 film, a 1979 film, a 2014 film and a 2020 film. Spelling
+    cannot separate them — the 1971 entry is a perfect match for the name, and
+    the wanted 2002 film is one letter away from the misspelling everyone else
+    uses. Only the year can, so a year is required and a candidate without one
+    is refused rather than guessed at. Attaching a plausible-looking but wrong
+    plot is precisely what this whole path exists to prevent.
+
+    With a year in hand the rule is deliberately loose on spelling: the year
+    carries the identity and the comparison is only a sanity bound that keeps
+    "Villa des roses" (0.53) out while admitting "Villain" (0.92). The strict
+    0.80 one-letter rule in :func:`_yt_title_cores_match` is not used here,
+    because rejecting single-letter differences is the very thing that hid
+    this film.
+    """
+    if not year:
+        return False
+    cand_year = str(candidate.get("year") or "")
+    if not cand_year or cand_year[:4] != year[:4]:
+        return False
+    if media_type and candidate.get("media_type") != media_type:
+        return False
+    want = _yt_title_core(title)
+    have = _yt_title_core(candidate.get("title") or "")
+    if not want or not have:
+        return False
+    return difflib.SequenceMatcher(None, want, have).ratio() >= 0.80
+
+
+def _imdb_year_from_uploads(uploads: list) -> str:
+    """The year a YouTube upload states in its own title, for identity lookups.
+
+    The upload is the only remaining evidence of what film was wanted, and its
+    title usually carries the release year ("Villan (2002) Full Tamil Movie").
+    """
+    for upload in uploads or []:
+        year = _YEAR_RE.search(upload.get("title") or "")
+        if year:
+            return year.group()
+    return ""
+
+
+def _resolve_by_imdb(title: str, year: str, media_type: str = "") -> dict | None:
+    """Identify a title by asking IMDb for suggestions, returning the match or None.
+
+    The typed year is appended to the name because a bare name is genuinely
+    ambiguous: "villain" suggests a 1971 film, a 2020 film and the 2002 film
+    alike, while "villan 2002" puts the right one first. That probe is tried on
+    its own first, and only if it comes back empty are spelling variants tried
+    at all — which is what catches the YouTube spelling "villan" for the film
+    every catalogue calls "villain". The variants are probed concurrently
+    because they are independent round trips, and the list is short, so waiting
+    for them in turn would dominate the time a miss costs.
+
+    Every candidate must survive :func:`_imdb_candidate_is_the_film`, so a
+    suggestion that merely sounds similar can never attach the wrong plot.
+    """
+    probes = [f"{title} {year}".strip() if year else title]
+    for variant in _title_variants(title):
+        probes.append(f"{variant} {year}".strip() if year else variant)
+    if len(probes) == 1:
+        return _first_imdb_match(probes[0], title, year, media_type)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(probes)) as ex:
+        futures = [
+            ex.submit(_first_imdb_match, probe, title, year, media_type)
+            for probe in probes
+        ]
+        for fut in futures:
+            try:
+                found = fut.result(timeout=30)
+            except Exception:
+                continue
+            if found:
+                return found
+    return None
+
+
+def _first_imdb_match(
+    probe: str, title: str, year: str, media_type: str
+) -> dict | None:
+    """First suggestion under one probe spelling that is really the film."""
+    for candidate in _imdb_suggest(probe):
+        if _imdb_candidate_is_the_film(candidate, title, year, media_type):
+            return candidate
+    return None
+
+
+def omdb_details(selected: dict) -> tuple[dict, str]:
+    """Fetch full detail (plot, ratings, cast, etc.) from OMDb for a selected title.
+
+    Returns (details, error); error is '' on success and otherwise carries the
+    reason runtime verification cannot run.
+    """
+    if selected.get("youtube_only"):
+        # No catalogue row exists, so there is no id to ask OMDb about. A blind
+        # `t=` lookup is worse than useless here: it resolves the name to
+        # whatever unrelated title OMDb considers closest — "Villan" gives a
+        # 1920 silent film, "Villain" a 2020 Korean film — and the UI would
+        # then show that film's plot and cast.
+        #
+        # So identify the film first. A YouTube upload usually names the release
+        # year in its own title, which is enough to ask IMDb for suggestions,
+        # and "villan 2002" returns the 2002 film first where "villan" alone
+        # does not. The suggestion is then checked for year and spelling before
+        # OMDb is asked for the real record by IMDb id.
+        uploads = st.session_state.get("yt_results") or []
+        year = _extract_year(selected.get("year") or _imdb_year_from_uploads(uploads))[1]
+        found = _resolve_by_imdb(selected.get("title") or "", year, selected.get("media_type") or "")
+        if found is None:
+            return {}, "not in the streaming catalogues"
+        selected["id"] = found["id"]
+        selected["year"] = found["year"] or selected.get("year") or ""
+        selected["title"] = found["title"]
+        selected["link"] = found["link"]
     params = {
         "apikey": OMDB_API_KEY,
         "plot": "full",
@@ -652,15 +1013,14 @@ def omdb_details(selected: dict) -> dict:
         year = str(selected.get("year") or "").strip()
         if year.isdigit():
             params["y"] = year
-    try:
-        with httpx.Client(timeout=10) as client:
-            resp = client.get(OMDB_BASE, params=params)
-            data = resp.json()
-    except httpx.HTTPError:
-        return {}
-    if data.get("Response") != "True":
-        return {}
-    return data
+    details, error = _omdb_fetch(params)
+    if details and not selected.get("poster"):
+        # The resolved record carries the poster the missing catalogue row had
+        # no way of supplying.
+        poster = details.get("Poster") or ""
+        if poster and poster != "N/A" and _poster_ok(poster):
+            selected["poster"] = poster
+    return details, error
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -676,17 +1036,9 @@ def _omdb_season_episode_count(details: dict, season: int) -> int:
     imdb_id = (details or {}).get("imdbID") or (details or {}).get("id") or ""
     if not imdb_id.startswith("tt"):
         return 0
-    try:
-        with httpx.Client(timeout=10) as client:
-            resp = client.get(
-                OMDB_BASE,
-                params={"apikey": OMDB_API_KEY, "i": imdb_id, "Season": season},
-            )
-            data = resp.json()
-    except httpx.HTTPError:
-        return 0
-    if data.get("Response") != "True":
-        return 0
+    data, _error = _omdb_fetch(
+        {"apikey": OMDB_API_KEY, "i": imdb_id, "Season": season}
+    )
     episodes = data.get("Episodes") or []
     count = len(episodes)
     return count if count > 0 else 0
@@ -702,6 +1054,52 @@ def _youtube_duration_minutes(iso: str) -> int:
         return 0
     d, h, min_, s = (int(x) if x else 0 for x in m.groups())
     return d * 1440 + h * 60 + min_ + (1 if s >= 30 else 0)
+
+
+class _YouTubeSearchError(Exception):
+    def __init__(self, status: str):
+        self.status = status
+        super().__init__(status)
+
+
+def _youtube_api_status(response, data) -> str:
+    try:
+        http_status = int(getattr(response, "status_code", 200) or 200)
+    except (TypeError, ValueError):
+        http_status = 200
+    payload_error = data.get("error", {}) if isinstance(data, dict) else {}
+    if not isinstance(payload_error, dict):
+        payload_error = {}
+    try:
+        api_code = int(payload_error.get("code") or http_status)
+    except (TypeError, ValueError):
+        api_code = http_status
+    reason = " ".join(
+        str(payload_error.get(key) or "")
+        for key in ("message", "errors")
+    ).lower()
+    if api_code == 429 or "quota" in reason:
+        return "quota"
+    if api_code in (401, 403):
+        return "auth"
+    if api_code >= 500:
+        return "unavailable"
+    if api_code >= 400:
+        return "error"
+    return "ok"
+
+
+def _youtube_response_data(response) -> dict:
+    try:
+        data = response.json()
+    except (TypeError, ValueError):
+        raise _YouTubeSearchError("unavailable") from None
+    status = _youtube_api_status(response, data)
+    if status != "ok":
+        raise _YouTubeSearchError(status)
+    if not isinstance(data, dict):
+        raise _YouTubeSearchError("error")
+    return data
 
 
 def _youtube_runtime_matches(duration: int, expected_minutes: int) -> bool:
@@ -776,14 +1174,86 @@ def _omdb_runtime_minutes(details: dict) -> int:
     return int(m.group(1)) if m else 0
 
 
-def _omdb_status(details: dict) -> str:
+# Substrings OMDb uses in its "Error" field, mapped to the state they mean.
+_OMDB_ERROR_STATES = (
+    (("daily limit", "limit reached", "too many requests", "requests per day"),
+     "rate_limited"),
+    (("api key", "unauthorized", "unrecognized", "not authorized"),
+     "auth_failed"),
+    (
+        ("not found", "unknown id", "incorrect id", "not in the streaming catalog"),
+        "not_found",
+    ),
+)
+
+
+def _omdb_status(details: dict, error: str = "") -> str:
+    """Classify what OMDb managed to tell us about the selected title.
+
+    'ready' is the only state that lets YouTube runtime verification run. Every
+    other state needs its own message: telling the user to "set OMDB_API_KEY"
+    when the real problem is an exhausted free quota sends them off to fix
+    something that is already configured.
+    """
     if not OMDB_API_KEY:
         return "not_configured"
     if not details:
+        reason = str(error or "").casefold()
+        for markers, state in _OMDB_ERROR_STATES:
+            if any(marker in reason for marker in markers):
+                return state
         return "unavailable"
     if _omdb_runtime_minutes(details) <= 0:
         return "runtime_missing"
     return "ready"
+
+
+# One honest sentence per state. Runtime verification is gated on "ready", so
+# each message explains what is missing. None of them stop the YouTube search —
+# without a reference runtime the app still lists full-length uploads, just
+# without the length cross-check.
+_OMDB_STATUS_MESSAGES = {
+    "not_configured": (
+        "OMDb is not configured, so runtimes can't be cross-checked and title "
+        "details are unavailable. Set OMDB_API_KEY in .env (or as an environment "
+        "variable), restart Streamlit, then select the title again."
+    ),
+    "auth_failed": (
+        "OMDb rejected the API key, so runtimes can't be cross-checked and title "
+        "details are unavailable. Check OMDB_API_KEY is a valid key from "
+        "omdbapi.com, then restart Streamlit."
+    ),
+    "rate_limited": (
+        "OMDb's free 1,000 requests/day limit is used up, so runtimes can't be "
+        "cross-checked and title details are unavailable until the limit resets. "
+        "Add a paid OMDb key to lift it."
+    ),
+    "not_found": (
+        "OMDb has no record for this title, so the video lengths below weren't "
+        "cross-checked against a runtime."
+    ),
+    "unavailable": (
+        "Couldn't load OMDb data, so the video lengths below weren't cross-checked "
+        "against a runtime and title details are unavailable."
+    ),
+    "runtime_missing": (
+        "OMDb recorded no runtime for this title, so the video lengths below "
+        "weren't cross-checked."
+    ),
+}
+
+
+def _omdb_status_message(status: str) -> str:
+    return _OMDB_STATUS_MESSAGES.get(
+        status,
+        "OMDb runtime data could not be loaded, so the video lengths below weren't "
+        "cross-checked. Select the title again.",
+    )
+
+
+# States where the app is working with reduced information rather than being
+# misconfigured. These get a quiet note instead of a warning.
+_OMDB_BENIGN_STATES = frozenset({"not_found", "runtime_missing"})
 
 
 def _omdb_original_lang(details: dict) -> str:
@@ -819,39 +1289,55 @@ def _channel_tier_for_video(channel: str, channel_id: str) -> str:
 # YouTube flow).
 _TIER_BONUS = {"tv": 300, "studio": 150, "movie_official": 150}
 
+# How many verified uploads to show. Most films have one or two legitimate
+# uploads, so this is a ceiling rather than a target.
+YOUTUBE_MOVIE_RESULT_LIMIT = 5
+
 # Set True to also keep strictly-verified uploads from NON-trusted channels
 # (title matches exactly + passes the language/duration checks). Default False =
-# "trusted channels only".
+# "trusted channels only"; the sidebar toggle flips it per session, because the
+# only legitimate upload of a regional film is often on a channel nobody has
+# reviewed.
 _ALLOW_UNTRUSTED_VERIFIED = False
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def youtube_full_movie(
+def _youtube_full_movie_cached(
     title: str, year: str = "", media_type: str = "", lang: str = "",
     expected_minutes: int = 0, strict_lang: bool = False,
-    audit_version: str = "",
+    audit_version: str = "", include_unofficial: bool = False,
+    search_epoch: str = "",
 ) -> list:
     """Find YouTube uploads that are actually full movies / full episodes.
 
     Searches YouTube "full movie" / "full episodes", then fetches every video's
     duration in one batch call and keeps only entries long enough to be a real
     film or episode (trailers, recaps, and explainers are far shorter and are
-    also title-filtered). Results are ranked by title+year match (top 3). A
-    language hint (e.g. 'ta') biases the search and boosts matching titles.
-    When `expected_minutes` is given (movie runtime from OMDb), uploads whose
+    also title-filtered). Results are ranked by title+year match. A language
+    hint (e.g. 'ta') biases the search and boosts matching titles. When
+    `expected_minutes` is given (movie runtime from OMDb), uploads whose
     duration deviates by more than 10% are dropped. `lang` is the effective
     language (user's hint, else the movie's original language when no hint was
     given); with `strict_lang=True` the upload must also name that language.
-    Full-movie results come from trusted channels only (official TV, studio, or
-    curated movie channels) unless _ALLOW_UNTRUSTED_VERIFIED is set.
+
+    `expected_minutes` of 0 means OMDb has no record for the title, so there is
+    nothing to compare against. The runtime check is then skipped rather than
+    failed — a long-enough, correctly-titled upload is shown and flagged as
+    unverified, because reporting nothing at all would hide a film that is
+    genuinely on YouTube.
     """
     if not YOUTUBE_API_KEY:
         return []
     marker = _LANGUAGE_HINTS.get(lang, (None, ""))[1]
     keyword = "full movie" if media_type == "movie" else "full episodes"
     min_length = 90 if media_type == "movie" else 20
+    runtime_known = expected_minutes > 0
 
-    def _collect(query: str) -> list:
+    query_status = "ok"
+    successful_queries = 0
+
+    def _collect(query: str, use_language: bool) -> list:
+        nonlocal query_status, successful_queries
         if not query.strip():
             return []
         params = {
@@ -862,23 +1348,29 @@ def youtube_full_movie(
             "maxResults": 50,
             "key": YOUTUBE_API_KEY,
         }
-        if marker:
+        if use_language and marker:
             params["relevanceLanguage"] = lang
         try:
             with httpx.Client(timeout=10) as client:
-                data = client.get(YOUTUBE_SEARCH_URL, params=params).json()
-                items = data.get("items", [])
+                search_data = _youtube_response_data(
+                    client.get(YOUTUBE_SEARCH_URL, params=params)
+                )
+                items = search_data.get("items") or []
+                if not isinstance(items, list):
+                    raise _YouTubeSearchError("error")
                 ids = ",".join(
                     item["id"]["videoId"]
                     for item in items
-                    if item.get("id", {}).get("videoId")
+                    if isinstance(item, dict)
+                    and isinstance(item.get("id"), dict)
+                    and item["id"].get("videoId")
                 )
                 durations = {}
                 audio_langs = {}
                 statuses = {}
                 descriptions = {}
                 if ids:
-                    videos = (
+                    videos_data = _youtube_response_data(
                         client.get(
                             YOUTUBE_VIDEOS_URL,
                             params={
@@ -887,36 +1379,51 @@ def youtube_full_movie(
                                 "key": YOUTUBE_API_KEY,
                             },
                         )
-                        .json()
-                        .get("items", [])
                     )
+                    videos = videos_data.get("items") or []
+                    if not isinstance(videos, list):
+                        raise _YouTubeSearchError("error")
                     for video in videos:
+                        if not isinstance(video, dict):
+                            continue
                         durations[video["id"]] = _youtube_duration_minutes(
-                            video.get("contentDetails", {}).get("duration", "")
+                            (video.get("contentDetails", {}) or {}).get("duration", "")
                         )
+                        snippet = video.get("snippet", {}) or {}
+                        if not isinstance(snippet, dict):
+                            snippet = {}
                         audio_langs[video["id"]] = _normalize_audio_lang(
-                            (video.get("snippet", {}) or {}).get("defaultAudioLanguage")
+                            snippet.get("defaultAudioLanguage")
                         )
                         descriptions[video["id"]] = (
-                            (video.get("snippet", {}) or {}).get("description", "") or ""
-                        )
+                            snippet.get("description", "") or ""
+                        )[:400]
                         stt = video.get("status", {}) or {}
                         statuses[video["id"]] = (
                             stt.get("privacyStatus", ""),
                             bool(stt.get("embeddable")),
                             stt.get("uploadStatus", ""),
                         )
-        except httpx.HTTPError:
+        except _YouTubeSearchError as exc:
+            if query_status == "ok":
+                query_status = exc.status
+            return []
+        except (httpx.HTTPError, OSError, TypeError, ValueError):
+            if query_status == "ok":
+                query_status = "unavailable"
             return []
 
+        successful_queries += 1
         picked = []
         for item in items:
-            vid = item.get("id", {}).get("videoId", "")
-            snippet = item.get("snippet", {})
+            if not isinstance(item, dict):
+                continue
+            vid = (item.get("id", {}) or {}).get("videoId", "")
+            snippet = item.get("snippet", {}) or {}
+            if not isinstance(snippet, dict):
+                snippet = {}
             if not vid:
                 continue
-            # videos.list only returns existing videos, so a missing status
-            # means the link is dead (deleted/privated video) -> drop it.
             status = statuses.get(vid)
             if not status:
                 continue
@@ -932,22 +1439,30 @@ def youtube_full_movie(
             channel_id = snippet.get("channelId", "") or ""
             if any(word in video_title.lower() for word in _YOUTUBE_BAD_WORDS):
                 continue
-            # Reaction uploads retitle videos to look like the real film, so the
-            # title filter isn't enough — scan channel + title + description too.
             if _looks_like_reaction(channel, video_title, descriptions.get(vid, "")):
                 continue
             audio = audio_langs.get(vid, "")
-            if lang:
+            # A language the user asked for ("interstellar in tamil") is a
+            # requirement. A language inferred from OMDb's record is only a
+            # hint: uploader-set defaultAudioLanguage is routinely wrong for
+            # regional and dubbed uploads (a Kannada film tagged "en"), so
+            # hard-filtering on it hid films that were there. It ranks instead,
+            # below.
+            if lang and strict_lang:
                 if audio and audio != lang:
                     continue
                 if _other_lang_audio(video_title, lang):
                     continue
-                if strict_lang and not _confirm_lang(video_title, audio, lang):
+                if not _confirm_lang(video_title, audio, lang):
                     continue
-            thumb = snippet.get("thumbnails", {}).get("medium", {}).get("url", "") or ""
+            thumb = (
+                (snippet.get("thumbnails", {}) or {}).get("medium", {}) or {}
+            ).get("url", "") or ""
             duration = durations[vid]
             tier = _channel_tier_for_video(channel, channel_id)
-            mismatch = not _youtube_runtime_matches(duration, expected_minutes)
+            mismatch = runtime_known and not _youtube_runtime_matches(
+                duration, expected_minutes
+            )
             picked.append(
                 {
                     "video_id": vid,
@@ -959,50 +1474,159 @@ def youtube_full_movie(
                     "audio_lang": audio,
                     "thumbnail": thumb,
                     "duration_mismatch": mismatch,
+                    "runtime_verified": runtime_known and not mismatch,
                     "link": f"https://www.youtube.com/watch?v={vid}",
                 }
             )
         return picked
 
-    results = _collect(f"{title} {year} {keyword}")
-    if lang and not results:
-        results = _collect(f"{title} {year} {marker} {keyword}")
-
-    # Drop unrelated, pirated AND untrusted uploads. The channel must be on a
-    # trusted tier (official TV / studio / curated movie channels); only those
-    # may supply full movies. Every trusted result must name the queried movie
-    # literally. Pirate-branded uploads are rejected outright even when the
-    # title matches.
-    results = [
-        r for r in results
-        if not _looks_pirated(r["channel"], r["title"])
-        and (
-            (
-                r["official_tier"] in _TRUSTED_TIERS
-                and _yt_title_exact_match(r["title"], title)
-            )
-            or (
-                _ALLOW_UNTRUSTED_VERIFIED
-                and r["official_tier"] not in _TRUSTED_TIERS
-                and _yt_title_exact_match(r["title"], title)
-            )
-        )
+    queries = [
+        (f"{title} {year} {keyword}".strip(), True),
+        (f"{title} {keyword}".strip(), False),
     ]
+    if marker:
+        queries.append((f"{title} {marker} {keyword}".strip(), True))
+    queries = list(dict.fromkeys(queries))
+    pool = []
+    allow_unofficial = include_unofficial or _ALLOW_UNTRUSTED_VERIFIED
 
-    # Drop movies whose duration differs from OMDb by more than 10%; a missing
-    # reference runtime is treated as unverifiable.
-    results = [r for r in results if not r.get("duration_mismatch")]
+    def _verified(candidates: list) -> list:
+        out = []
+        for result in candidates:
+            if _looks_pirated(result["channel"], result["title"]):
+                continue
+            if result["official_tier"] not in _TRUSTED_TIERS and not allow_unofficial:
+                continue
+            if not _yt_title_exact_match(result["title"], title):
+                continue
+            if result.get("duration_mismatch"):
+                continue
+            # A language the user asked for must be obeyed. A language OMDb
+            # inferred for the film is only a hint, because regional uploads
+            # frequently declare the wrong `defaultAudioLanguage`; it still
+            # disqualifies a candidate whose own title and audio both point at
+            # another language, which is how the unrelated Kannada "Villan"
+            # film was being offered alongside the Tamil one.
+            if lang and strict_lang and audio_disagrees(result):
+                continue
+            out.append(result)
+        return out
+
+    def audio_disagrees(result: dict) -> bool:
+        if not lang or strict_lang or not result.get("audio_lang"):
+            return False
+        if _other_lang_audio(result["title"], lang):
+            return True
+        return _normalize_audio_lang(result["audio_lang"]) != lang
+
+    for query, use_language in queries:
+        picked = _collect(query, use_language)
+        if not picked and query_status != "ok":
+            break
+        by_id = {result["video_id"]: result for result in [*pool, *picked]}
+        pool = list(by_id.values())
+        if _verified(pool):
+            break
+
+    results = _verified(pool)
+    if not results and query_status != "ok":
+        raise _YouTubeSearchError(query_status)
 
     results.sort(
-        key=lambda r: (
-            _yt_relevance_score(r["title"], title, year)
-            + _TIER_BONUS.get(r["official_tier"], 0)
-            + (60 if marker and marker in r["title"].lower() else 0),
-            r["duration"],
+        key=lambda result: (
+            _yt_relevance_score(result["title"], title, year)
+            + _TIER_BONUS.get(result["official_tier"], 0)
+            + (60 if marker and marker in result["title"].lower() else 0)
+            # OMDb's language, when the user didn't name one, is a preference
+            # rather than a filter.
+            + (40 if lang and not strict_lang and result.get("audio_lang") == lang else 0),
+            result["duration"],
         ),
         reverse=True,
     )
-    return results[:2]
+    return results[:YOUTUBE_MOVIE_RESULT_LIMIT]
+
+
+# Set once YouTube reports its daily search cap is reached. Searching costs
+# 100 units per query and a title lookup runs three of them, so the cap goes
+# quickly and retrying after it is gone is pure waste.
+_YT_QUOTA_SPENT = False
+
+
+def _mark_yt_quota_spent() -> None:
+    global _YT_QUOTA_SPENT
+    _YT_QUOTA_SPENT = True
+
+
+def youtube_full_movie(
+    title: str, year: str = "", media_type: str = "", lang: str = "",
+    expected_minutes: int = 0, strict_lang: bool = False,
+    audit_version: str = "", include_unofficial: bool = False,
+    search_epoch: str = "",
+) -> list:
+    # Once YouTube's daily search cap is reached, every later lookup is a
+    # guaranteed 429, and each attempt would still cost the three search
+    # queries this runs. Latching the failure means browsing titles stays
+    # responsive and the quota that is left is not spent on requests that
+    # cannot succeed. The latch is per-process, so a restart picks YouTube
+    # back up as soon as the counter resets.
+    if _YT_QUOTA_SPENT:
+        st.session_state["yt_status"] = "quota"
+        return []
+    try:
+        results = _youtube_full_movie_cached(
+            title,
+            year,
+            media_type,
+            lang,
+            expected_minutes,
+            strict_lang,
+            audit_version,
+            include_unofficial,
+            search_epoch,
+        )
+    except _YouTubeSearchError as exc:
+        st.session_state["yt_status"] = exc.status
+        if exc.status == "quota":
+            _mark_yt_quota_spent()
+        return []
+    st.session_state["yt_status"] = "ok" if results else "no_results"
+    return results
+
+
+# Why a YouTube lookup came back empty. Without these, an exhausted quota reads
+# as "this movie isn't on YouTube", which is a false negative the user cannot
+# act on.
+_YT_STATUS_MESSAGES = {
+    "quota": (
+        "YouTube's daily search quota is used up, so no full-movie results "
+        "could be looked up. The rest of the app is unaffected — this is a "
+        "limit on YouTube's search API, which costs 100 units per query "
+        "(3 per title here, so roughly 30 titles a day). It resets at "
+        "midnight Pacific time."
+    ),
+    "auth": (
+        "YouTube rejected the API key, so full-movie results couldn't be checked. "
+        "Check YOUTUBE_API_KEY, then restart Streamlit."
+    ),
+    "unavailable": (
+        "Couldn't reach YouTube, so full-movie results couldn't be checked. Try "
+        "again in a minute."
+    ),
+    "error": (
+        "YouTube returned an unexpected response, so full-movie results couldn't be "
+        "checked. Try again in a minute."
+    ),
+}
+
+_YT_FAILURE_STATES = frozenset(_YT_STATUS_MESSAGES)
+
+
+def _yt_status_message(status: str) -> str:
+    return _YT_STATUS_MESSAGES.get(status, "")
+
+
+youtube_full_movie.clear = _youtube_full_movie_cached.clear
 
 
 def _yt_relevance_score(result_title: str, title: str, year: str) -> int:
@@ -1033,28 +1657,112 @@ _YT_TITLE_MARKERS = (
     "version", "english", "tamil", "hindi", "telugu", "malayalam", "kannada",
     "blockbuster", "super", "hit", "superhit", "remastered", "rip", "ripped",
     "dvd", "bluray", "web", "official", "online", "watch", "best", "quality",
-    "tamilrockers", "tamilyogi", "copyright", "song", "video",
+    "tamilrockers", "tamilyogi", "copyright", "song", "video", "trailer",
+    "review", "explained", "reaction", "breakdown",
+    # Plurals of the above. Titles are inconsistent ("Full Movie" vs "Full
+    # Movies"), and only explicit entries are safe: stripping a trailing "s"
+    # would turn "3 Idiots" into "3 Idiot".
+    "movies", "films", "songs", "videos", "dubs", "trailers", "reviews",
 )
 
 
+def _yt_title_core(text: str) -> str:
+    """Upload noise removed from a title so only the film's own words remain.
+
+    Drops generic markers ("full movie", "in english", "1080p"), standalone
+    years, and the function words that glue a language or quality note onto a
+    title. Applied to the queried title as well as the upload, so a film whose
+    name genuinely contains a stopword ("Life In a Nutshell") still matches
+    itself.
+    """
+    return "".join(
+        word
+        for word in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if word not in _YT_TITLE_MARKERS
+        and word not in _STOPWORDS
+        and not re.fullmatch(r"19\d\d|20\d\d", word)
+    )
+
+
+# "Chapter 1", "Part 2" — kept in the title rather than stripped, because the
+# number after them is what keeps a film's entries apart.
+_YT_PART_TOKENS = ("chapter", "part", "vol", "season", "episode", "chap")
+
+
+def _yt_title_cores_match(query_core: str, chunk_core: str) -> bool:
+    """Decide whether one reduced title chunk stands for the queried film.
+
+    Two rules, in order:
+
+    * Numbers must agree when both sides carry them. A fuzzy comparison alone
+      rates "kgfchapter1" and "kgfchapter2" at 0.92, i.e. the same film. A
+      single side having no number is not a conflict, so "K.G.F: Chapter 1"
+      can still match an upload that just says "K.G.F: Chapter 1 Hindi".
+    * Otherwise the spellings must be near-identical, which admits the
+      romanisation drift endemic in regional catalogues — OMDb and JustWatch
+      write "Samuthiram" where the studio's own upload says "Samudhiram" — while
+      still separating different films that share a first syllable
+      ("Samuthiram" vs "Samasthanam" scores 0.67, "Aanandham" vs "Aanandham
+      Aarambam" scores 0.78).
+
+    Containment is deliberately *not* used. A sequel's title is its predecessor
+    plus extra words, so accepting "shorter title is inside longer title" would
+    answer every query for the first film with uploads of the second.
+    """
+    if not query_core or not chunk_core:
+        return False
+    if query_core == chunk_core:
+        return True
+    query_nums = re.findall(r"\d+", query_core)
+    chunk_nums = re.findall(r"\d+", chunk_core)
+    if query_nums and chunk_nums and query_nums != chunk_nums:
+        return False
+    # A trailing number is the entry of a series, so an upload that stops
+    # before it is a different film: "Bigil" is not "Bigil 2". Leading numbers
+    # are part of the name and are left alone ("3 Idiots").
+    query_tail = re.search(r"\d+$", query_core)
+    chunk_tail = re.search(r"\d+$", chunk_core)
+    if query_tail and (not chunk_tail or chunk_tail.group() != query_tail.group()):
+        return False
+    # A one or two letter tail is a sequel marker rather than a spelling
+    # variant: "3 Idiots" and "3 Idiots K" are 0.93 similar. A plural is not.
+    shorter, longer = sorted((query_core, chunk_core), key=len)
+    if (
+        longer.startswith(shorter)
+        and longer[-1] != "s"
+        and re.fullmatch(r"[a-z]{1,2}", longer[len(shorter):])
+    ):
+        return False
+    # One character longer is a different word far more often than a variant of
+    # the same one, and the fuzzy step cannot see the difference: "villan" and
+    # "villain" are 0.92 similar. The only exemptions are a plural "s" and a
+    # doubled letter, so a film's name can still grow a suffix.
+    if len(longer) - len(shorter) == 1 and longer[-1] != "s" and longer != shorter + shorter[-1]:
+        return False
+    # Similarity alone is too generous when the upload's title is much longer:
+    # "interstellar" and "interstellarwars" rate 0.96. Transliteration drift
+    # costs a letter or two, not a third of the name, so cap the gap.
+    if len(longer) - len(shorter) > max(2, len(shorter) // 4):
+        return False
+    return difflib.SequenceMatcher(None, query_core, chunk_core).ratio() >= 0.80
+
+
 def _yt_title_exact_match(result_title: str, title: str) -> bool:
-    """True only when a result's title names the queried movie exactly.
+    """True when a result's title names the queried movie.
 
     The title is split into chunks by typical upload separators, and each chunk
-    is checked after stripping generic markers ("full movie", "tamil", "hd",
-    year digits, ...) — so "Aanandham | Tamil Full Movie |..." passes but
-    "Aanandham Aarambam Tamil Full Movie" (a different film glued on) fails.
+    is reduced to the film's own words before being compared — so
+    "Aanandham | Tamil Full Movie |..." passes, "Interstellar Full Movie In
+    English" passes (the trailing "in" and language note are not part of the
+    name), and "Aanandham Aarambam Tamil Full Movie" (a different film glued
+    on) still fails. Chunk comparison is delegated to
+    :func:`_yt_title_cores_match` so spelling variants still land.
     """
-    q = _normalize_title(title)
+    q = _yt_title_core(title)
     if not q:
         return False
     for chunk in re.split(r"[|,()\[\]:;_~*\-]+", result_title):
-        words = re.findall(r"[a-z0-9]+", chunk.lower())
-        core = "".join(
-            w for w in words
-            if w not in _YT_TITLE_MARKERS and not re.fullmatch(r"19\d\d|20\d\d", w)
-        )
-        if core == q:
+        if _yt_title_cores_match(q, _yt_title_core(chunk)):
             return True
     return False
 
@@ -1582,8 +2290,6 @@ def justwatch_search(query: str, verify_poster: bool = True, count: int = 24) ->
         if not entry.title:
             continue
         poster = entry.poster or ""
-        if poster and verify_poster and not _poster_ok(poster):
-            poster = ""
         results.append(
             {
                 "id": entry.entry_id,
@@ -1594,6 +2300,8 @@ def justwatch_search(query: str, verify_poster: bool = True, count: int = 24) ->
                 "link": entry.url or "",
             }
         )
+    if verify_poster:
+        _verify_posters(results)
     return results
 
 
@@ -1614,12 +2322,34 @@ def _significant_tokens(text: str) -> list:
 
 
 def _title_contains_query(query: str, title: str) -> bool:
-    """True if the title contains every significant query word (rejects
-    loose JustWatch hits like unrelated titles or mis-listed duplicates)."""
-    t = "".join(ch for ch in (title or "").lower() if ch.isalnum())
-    if not t:
+    """True if the title contains every significant query word.
+
+    Matching is per word, and only in the direction where the query word sits
+    inside a title word ("iron" in "Ironman"). Comparing against a run of glued
+    characters meant "Villa Negra" collapsed to "villanegra", which contains the
+    query "villan" and put an unrelated 1963 film at the top of a search for the
+    Ajith Kumar movie. The gap is capped so "villan" does not match the much
+    longer "villanelle".
+    """
+    words = {
+        "".join(ch for ch in word if ch.isalnum())
+        for word in (title or "").lower().split()
+    }
+    words.discard("")
+    if not words:
         return False
-    return all(word in t for word in _significant_tokens(query))
+    for token in _significant_tokens(query):
+        if any(
+            token == word
+            # "iron" in "Ironman" and "man" in "Ironman": a compound title
+            # written as one word still names the film.
+            or (len(token) >= 3 and word.startswith(token) and len(word) - len(token) <= 3)
+            or (len(token) >= 3 and word.endswith(token) and len(word) - len(token) <= 4)
+            for word in words
+        ):
+            continue
+        return False
+    return True
 
 
 def _token_set(text: str) -> set:
@@ -1812,22 +2542,105 @@ def fuzzy_suggest(query: str, limit: int = 3) -> list:
     ]
     scored.sort(key=lambda pair: pair[0], reverse=True)
     chosen = [item for _, item in scored[:limit]]
-    for item in chosen:
-        poster = item.get("poster")
-        if poster and not _poster_ok(poster):
-            item["poster"] = _fallback_poster(item["title"], item.get("year") or "") or None
-    return chosen
+    return _verify_posters(chosen)
+
+
+def _correction_candidates(query: str, results: list) -> list:
+    """The titles worth offering as a correction for a misspelled query.
+
+    Both catalogues answer a misspelling rather than refusing it, so "villan"
+    comes back as a 1920 silent film and a Kannada one, and the wrong answer
+    gets picked by default. Scoring what the search already returned and
+    labelling the close ones as an explicit correction fixes that without a
+    single extra request; only a query whose own results offer nothing
+    plausible falls through to the wider `fuzzy_suggest` sweep.
+
+    Similarity decides, not the word-overlap ordering used for search results.
+    `_title_score` rates "John Wick" a top mark of 3 for the query "jonas",
+    because it measures how results should be ordered rather than how well
+    they answer the question. The 0.82 similarity gate is what separates a
+    real correction ("villan" -> "Villain", 0.92) from a coincidence
+    ("jonas" -> "John Wick", 0.46).
+    """
+    if not query:
+        return []
+    scored = [
+        (score, item)
+        for item in results
+        if (score := _fuzzy_suggest_score(query, item["title"])) >= _MIN_SUGGEST_SCORE
+        and len(_normalize_title(item["title"])) >= _MIN_SUGGEST_TITLE_LEN
+    ]
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    # The same film arrives from more than one provider, and can also turn up
+    # twice from the misspelling pass, so collapse by title: three rows all
+    # reading "Villain" is not a choice, it is a stutter.
+    picks = []
+    seen = set()
+    for _score, item in scored:
+        key = _normalize_title(item["title"])
+        if key in seen:
+            continue
+        seen.add(key)
+        picks.append(item)
+        if len(picks) == 3:
+            break
+    return picks
+
+
+_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+
+
+def _extract_year(query: str) -> tuple:
+    """Split a year out of a search query, returning (query, year).
+
+    "Villan 2011" names a year, not a word of the title. Left in place it became
+    a required title token, so every result was rejected and the search came
+    back empty. OMDb rejects `s=Villan 2011` outright, so it is removed from
+    the provider queries too and used to rank instead.
+    """
+    years = _YEAR_RE.findall(query)
+    if not years:
+        return " ".join(query.split()), ""
+    return " ".join(_YEAR_RE.sub(" ", query).split()), years[-1]
+
+
+def _catalogue_search(query: str, media_hint: str) -> list:
+    """Ask OMDb and JustWatch for the same query at the same time.
+
+    Neither provider knows the other exists, so running them one after the
+    other made every search pay for the sum of their latencies — around 4.8s
+    measured for an unhinted search. Concurrently the wait is the slower of the
+    two. JustWatch is asked second so that a slow or failing provider cannot
+    delay OMDb's rows, which are the ones carrying IMDb ids and posters.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        omdb_future = ex.submit(omdb_search, query, media_hint)
+        jw_future = ex.submit(justwatch_search, query)
+        results = []
+        for fut in (omdb_future, jw_future):
+            try:
+                results.extend(fut.result(timeout=45))
+            except Exception:
+                continue
+    return results
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def search(query: str) -> list:
+    """Titles matching a query, best match first.
+
+    Cached for six hours like the other lookups: re-submitting a title is
+    common, and each miss otherwise costs several seconds of provider latency
+    to arrive at the same answer.
+    """
     query, media_hint, _ = _extract_hints(query)
+    query, year_hint = _extract_year(query)
     query = query.strip()
     if not query:
         return []
     results = [
         item
-        for item in (omdb_search(query, media_hint) + justwatch_search(query))
+        for item in _catalogue_search(query, media_hint)
         if (not media_hint or item["media_type"] == media_hint)
         and _title_contains_query(query, item["title"])
     ]
@@ -1839,8 +2652,115 @@ def search(query: str) -> list:
         if any(_fuzzy_same_movie(item, k) for k in kept):
             continue
         kept.append(item)
-    kept.sort(key=lambda item: _title_score(query, item["title"]))
+    # A year the user typed outranks a better-spelled title from another year.
+    kept.sort(
+        key=lambda item: (
+            0 if year_hint and item.get("year") == year_hint else 1,
+            _title_score(query, item["title"]),
+        )
+    )
+    if not _has_exact_title(kept, query):
+        kept = _variant_pass(query, year_hint, media_hint, kept)
+    if not _has_exact_title(kept, query):
+        kept = _offer_youtube_only(query, year_hint, kept)
     return kept
+
+
+def _variant_pass(query: str, year_hint: str, media_hint: str, kept: list) -> list:
+    """Look the typed name up again under its common misspellings.
+
+    A catalogue that spells a film one letter away from the user's memory hides
+    it completely — OMDb's own search returns nothing for both "Villan" and
+    "Villain", while the record exists. Asking with the neighbouring spellings
+    finds it, and each hit is matched against the variant it was found under
+    rather than the original query, because the original query is precisely the
+    thing that did not match.
+
+    Only run once the catalogues have reported a miss: every variant is another
+    round trip, and a hit here may be a different film with a similar name, so
+    the bar is an exact or near-exact title match, not the loose search filter.
+    """
+    extra = []
+    seen = {_dedup_key(item) for item in kept}
+    for variant in _title_variants(query):
+        v_core = _yt_title_core(variant)
+        for item in omdb_search(variant, media_hint) + _imdb_suggest(variant):
+            if media_hint and item.get("media_type") != media_hint:
+                continue
+            if year_hint and item.get("year") and item["year"][:4] != year_hint[:4]:
+                continue
+            title_core = _yt_title_core(item.get("title") or "")
+            if title_core != v_core and not _yt_title_cores_match(v_core, title_core):
+                continue
+            key = _dedup_key(item)
+            if key in seen:
+                continue
+            if any(_fuzzy_same_movie(item, other) for other in [*kept, *extra]):
+                continue
+            seen.add(key)
+            extra.append(item)
+    if not extra:
+        return kept
+    extra.sort(
+        key=lambda item: (
+            0 if year_hint and item.get("year") == year_hint else 1,
+            _title_score(query, item["title"]),
+        )
+    )
+    return [*extra, *kept]
+
+
+def _has_exact_title(items: list, query: str) -> bool:
+    """True when the catalogue already has the film under the typed name."""
+    wanted = _normalize_title(query)
+    return any(_normalize_title(item["title"]) == wanted for item in items)
+
+
+def _offer_youtube_only(query: str, year_hint: str, kept: list) -> list:
+    """Offer a row for a film the streaming catalogues have no entry for.
+
+    Some films are missing from both OMDb and JustWatch — searching "Villan"
+    returned only "Villa Negra" and friends, with the Ajith Kumar film absent
+    from every provider even though a studio upload of it exists. Rather than
+    report nothing, probe YouTube and offer the title.
+
+    The upload usually states the release year in its own title, and that year
+    is often the only thing distinguishing the film from its namesakes, so it is
+    used to identify the title through :func:`_resolve_by_imdb`. When that
+    succeeds the row is a real catalogue entry with a poster and an IMDb link
+    rather than a placeholder, and `omdb_details` fills it in normally. Only if
+    the film cannot be identified is the row marked `youtube_only`, which makes
+    `omdb_details` skip the OMDb lookup — a blind `t=` lookup would attach
+    whatever unrelated title OMDb considers closest, which for "Villan" is a
+    1920 silent film.
+    """
+    if not YOUTUBE_API_KEY or len(query) < 3:
+        return kept
+    try:
+        found = youtube_full_movie(
+            query, year_hint, "movie", "", 0, False, _CHANNEL_AUDIT_VERSION, True,
+        )
+    except Exception:
+        return kept
+    if not found:
+        return kept
+    row_year = year_hint or _imdb_year_from_uploads(found)
+    row_title = query.title() if query.islower() else query
+    identified = _resolve_by_imdb(row_title, row_year, "movie")
+    if identified:
+        return [identified, *kept]
+    return [
+        {
+            "id": "",
+            "media_type": "movie",
+            "title": row_title,
+            "year": row_year,
+            "poster": None,
+            "link": "",
+            "youtube_only": True,
+        },
+        *kept,
+    ]
 
 
 def _pick_jw_entry(imdb_id, title, year, expected_type, entries):
@@ -1975,8 +2895,55 @@ def _chip(label: str, color: str) -> str:
     return (
         f'<span style="display:inline-block;padding:2px 10px;border-radius:999px;'
         f'background:{color};color:#fff;font-size:.78rem;font-weight:600;'
-        f'letter-spacing:.04em;text-transform:uppercase">{label}</span>'
+        f'letter-spacing:.04em;text-transform:uppercase">{_escape(label)}</span>'
     )
+
+
+# Where a YouTube upload came from, as a visible chip. A broadcaster's TV channel
+# (Jaya TV, Kalaingar TV, Sun TV) is a rebroadcast of a film, which is a
+# different thing from the studio's own upload (Sun Pictures, AVM Productions)
+# even though both pass the runtime check — so the two are labelled apart.
+_TIER_BADGES = {
+    "tv": ("TV Channel", "#16a085"),
+    "studio": ("Official Studio", "#6ea8ff"),
+    "movie_official": ("Official Label", "#8e6ee0"),
+}
+
+# Shown on full-movie results, which only reach the list after passing the OMDb
+# runtime comparison within YOUTUBE_RUNTIME_TOLERANCE.
+_RUNTIME_BADGE = ("Runtime ✓", "#16a085")
+
+# OMDb had no record for the title, so the length was never cross-checked. The
+# upload is still a full-length, correctly-titled video — just not confirmed.
+_RUNTIME_UNKNOWN_BADGE = ("Runtime unverified", "#8c95a8")
+
+# A result from a channel that isn't on the reviewed list. Deliberately drab:
+# the point is that it reads as weaker than a broadcaster or studio badge.
+_UNTRUSTED_BADGE = ("Unverified Channel", "#8c95a8")
+
+
+def _tier_badge(tier: str) -> str:
+    """Chip naming the source of a YouTube upload; '' for untrusted channels."""
+    entry = _TIER_BADGES.get(tier or "")
+    return _chip(*entry) if entry else ""
+
+
+def _trust_badges(tier: str, runtime_verified: bool | None = True) -> str:
+    """Chips describing where a YouTube upload came from and how it was checked.
+
+    Every result is labelled, including the unverified ones — when results from
+    unreviewed channels are allowed through, the user has to be able to see
+    that at a glance instead of assuming a broadcaster posted it.
+
+    `runtime_verified` is None for series playlists, which are checked by
+    episode count rather than length and so get no runtime chip at all.
+    """
+    chips = [_tier_badge(tier) or _chip(*_UNTRUSTED_BADGE)]
+    if runtime_verified is True:
+        chips.append(_chip(*_RUNTIME_BADGE))
+    elif runtime_verified is False:
+        chips.append(_chip(*_RUNTIME_UNKNOWN_BADGE))
+    return " ".join(chip for chip in chips if chip)
 
 
 def _navigate_chip(link: dict) -> str:
@@ -2054,33 +3021,84 @@ def _render_result_cards(items: list):
         if cols[2].button("Select", key=f"select-{item['id']}", use_container_width=True):
             with st.spinner("Loading details, providers & YouTube matches..."):
                 season = st.session_state.get("season")
+                # Resolve the title before the session copy is taken: a row that
+                # started life as a YouTube-only placeholder is given its real
+                # IMDb id, year, poster and link here, and everything below
+                # needs to see the enriched values.
+                details, omdb_error, providers = _resolve_selection(item)
                 st.session_state["selected"] = {**item, "season": season}
-                st.session_state["providers"] = get_providers(item)
-                details = omdb_details(item)
+                st.session_state["providers"] = providers
                 st.session_state["details"] = details
-                omdb_status = _omdb_status(details)
+                omdb_status = _omdb_status(details, omdb_error)
                 st.session_state["omdb_status"] = omdb_status
-                user_lang = st.session_state.get("yt_lang") or ""
-                if item["media_type"] == "movie":
-                    orig_lang = _omdb_original_lang(details)
-                    eff_lang = user_lang or orig_lang
-                    if user_lang or not orig_lang:
-                        st.session_state.pop("yt_auto_lang", None)
-                    else:
-                        st.session_state["yt_auto_lang"] = next(
-                            (k for k, (iso, _m) in _LANGUAGE_HINTS.items() if iso == orig_lang), ""
-                        )
-                    if omdb_status == "ready":
-                        st.session_state["yt_results"] = youtube_full_movie(
-                            item["title"], item.get("year") or "", item["media_type"], eff_lang,
-                            _omdb_runtime_minutes(details), bool(user_lang),
-                            _CHANNEL_AUDIT_VERSION,
-                        )
-                    else:
-                        st.session_state["yt_results"] = []
-                else:
-                    st.session_state.pop("yt_auto_lang", None)
-                    st.session_state.pop("yt_results", None)
+                st.session_state["omdb_error"] = omdb_error
+                _load_youtube_for_selected(item, details, omdb_status)
+
+
+def _resolve_selection(item: dict) -> tuple:
+    """Fetch a row's details and its watch providers.
+
+    For an ordinary catalogue row the two are independent: OMDb supplies plot
+    and ratings, JustWatch supplies offers, and neither consults the other.
+    They are fetched together so a click costs the slower of the two rather
+    than their sum.
+
+    A YouTube-only row is the exception, because identifying it rewrites its
+    id, title and year in place — the fields JustWatch matches on. Resolving it
+    first, then asking for providers, is what lets a title no catalogue carries
+    still come back with the right offers instead of none.
+    """
+    if item.get("youtube_only"):
+        details, error = omdb_details(item)
+        return details, error, get_providers(item)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        detail_future = ex.submit(omdb_details, item)
+        provider_future = ex.submit(get_providers, item)
+        try:
+            details, error = detail_future.result(timeout=45)
+        except Exception as exc:
+            details, error = {}, str(exc)
+        try:
+            providers = provider_future.result(timeout=45)
+        except Exception:
+            providers = dict(EMPTY_PROVIDERS)
+    return details, error, providers
+
+
+def _load_youtube_for_selected(
+    selected: dict, details: dict, omdb_status: str
+) -> None:
+    """Run the YouTube lookup for the current selection and stash the results.
+
+    Shared by the initial "Select" click and by the unverified-channels toggle,
+    which has to re-run the lookup because `include_unofficial` is part of the
+    result cache key.
+
+    A missing OMDb runtime is not treated as a blocker: many regional and older
+    titles are absent from OMDb entirely, and reporting no YouTube results at
+    all for those hides films that really are available. The lookup runs with
+    `expected_minutes=0`, which drops the runtime comparison and flags the
+    results as unverified instead.
+    """
+    user_lang = st.session_state.get("yt_lang") or ""
+    if selected.get("media_type") != "movie":
+        st.session_state.pop("yt_auto_lang", None)
+        st.session_state.pop("yt_results", None)
+        return
+    orig_lang = _omdb_original_lang(details)
+    eff_lang = user_lang or orig_lang
+    if user_lang or not orig_lang:
+        st.session_state.pop("yt_auto_lang", None)
+    else:
+        st.session_state["yt_auto_lang"] = next(
+            (k for k, (iso, _m) in _LANGUAGE_HINTS.items() if iso == orig_lang), ""
+        )
+    st.session_state["yt_results"] = youtube_full_movie(
+        selected["title"], selected.get("year") or "", selected["media_type"],
+        eff_lang, _omdb_runtime_minutes(details), bool(user_lang),
+        _CHANNEL_AUDIT_VERSION,
+        bool(st.session_state.get("yt_include_unofficial", True)),
+    )
 
 
 def main():
@@ -2091,6 +3109,37 @@ def main():
         "Search any movie, TV series, or anime and find out where it's streaming in India. "
         "Add a language to prioritize it on YouTube (e.g. \"One Piece (Mention Movie or Series after movie name) in Japanese\")."
     )
+
+    # Trusted channels are the only ones allowed by default, which hides the
+    # majority of regional and non-English films — the sole legitimate upload of
+    # a Tamil or Kannada film is often on a channel nobody has reviewed. The
+    # toggle is on by default and the unverified results are badged, so widening
+    # the net doesn't silently pass unvetted links off as official.
+    st.session_state["yt_include_unofficial"] = st.checkbox(
+        "Include uploads from unverified channels",
+        value=True,
+        help=(
+            "On: any channel counts, as long as the video names the film and its "
+            "length matches OMDb's runtime. Those results are badged "
+            "\"Unverified channel\". Off: only official broadcasters, studios and "
+            "movie labels."
+        ),
+    )
+    if st.session_state["yt_include_unofficial"] != st.session_state.get(
+        "_yt_unofficial_seen"
+    ):
+        st.session_state["_yt_unofficial_seen"] = st.session_state[
+            "yt_include_unofficial"
+        ]
+        # The visible results were built with the other setting, so re-run the
+        # lookup for the open title instead of showing a stale list.
+        if st.session_state.get("selected"):
+            with st.spinner("Rechecking YouTube matches..."):
+                _load_youtube_for_selected(
+                    st.session_state["selected"],
+                    st.session_state.get("details") or {},
+                    st.session_state.get("omdb_status", "unavailable"),
+                )
 
     with st.form("search_form"):
         query = st.text_input(
@@ -2106,7 +3155,13 @@ def main():
         st.session_state["season"] = season
         with st.spinner("Searching movies & shows..."):
             results = search(query)
-            suggestions = fuzzy_suggest(query) if not results else []
+            # An exact match needs no correction. Otherwise prefer scoring the
+            # rows already in hand over a second, slower sweep of the
+            # catalogues for something closer.
+            exact = _has_exact_title(results, query)
+            suggestions = [] if exact else _correction_candidates(query, results)
+            if not suggestions and not exact:
+                suggestions = fuzzy_suggest(query)
         st.session_state["results"] = results
         st.session_state["suggestions"] = suggestions
         st.session_state["hint_label"] = hint_label
@@ -2115,6 +3170,9 @@ def main():
         st.session_state.pop("providers", None)
         st.session_state.pop("details", None)
         st.session_state.pop("yt_results", None)
+        st.session_state.pop("omdb_status", None)
+        st.session_state.pop("omdb_error", None)
+        st.session_state.pop("yt_status", None)
         if not results and not suggestions:
             if hint_label:
                 type_name = "Movie" if hint_label == "movie" else "TV series"
@@ -2125,19 +3183,28 @@ def main():
                 st.info("No results found for that title. Try a different spelling.")
 
     results = st.session_state.get("results", [])
-    if results:
-        st.subheader("Results")
+    suggestions = st.session_state.get("suggestions", [])
+    # A correction and a search result are the same film, so the suggested rows
+    # are pulled out of the results list rather than rendered twice.
+    suggested = {_dedup_key(item) for item in suggestions}
+    others = [item for item in results if _dedup_key(item) not in suggested]
+    if suggestions:
+        st.subheader("Did you mean?")
+        if results:
+            st.caption(
+                "Nothing here is an exact match for that spelling. "
+                "Did you mean one of these?"
+            )
+        else:
+            st.caption("No exact match found. Did you mean one of these?")
+        _render_result_cards(suggestions)
+    if others:
+        st.subheader("Results" if not suggestions else "Other results")
         hint_label = st.session_state.get("hint_label")
         if hint_label:
             type_name = "Movie" if hint_label == "movie" else "TV series"
             st.caption(f"Showing {type_name} results only")
-        _render_result_cards(results)
-
-    suggestions = st.session_state.get("suggestions", [])
-    if suggestions:
-        st.subheader("Did you mean?")
-        st.caption("No exact match found. Did you mean one of these?")
-        _render_result_cards(suggestions)
+        _render_result_cards(others)
 
     selected = st.session_state.get("selected")
     if selected:
@@ -2165,18 +3232,15 @@ def main():
 
         details = st.session_state.get("details")
         omdb_status = st.session_state.get("omdb_status", "unavailable")
+        omdb_error = st.session_state.get("omdb_error", "")
         if not details:
-            if omdb_status == "not_configured":
-                st.warning(
-                    "OMDb is not configured, so runtime verification and title details are unavailable. "
-                    "Set OMDB_API_KEY and select the title again."
-                )
-            elif omdb_status == "runtime_missing":
-                st.warning(
-                    "OMDb returned no usable runtime, so YouTube runtime verification is unavailable."
-                )
+            # A title OMDb simply doesn't carry shouldn't look like a fault.
+            if omdb_status in _OMDB_BENIGN_STATES:
+                st.info(_omdb_status_message(omdb_status))
             else:
-                st.info("Couldn't load description & reviews for this title.")
+                st.warning(_omdb_status_message(omdb_status))
+            if omdb_error:
+                st.caption(f"OMDb reported: {omdb_error}")
         else:
             st.subheader("Description")
             plot = (details.get("Plot") or "").strip()
@@ -2264,13 +3328,13 @@ def main():
                         with ycols[1]:
                             al = r.get("audio_lang") or ""
                             audio_chip = f" · {_escape(al)} audio" if al else ""
-                            tier_tag = {"tv": " · Official TV", "studio": " · Official",
-                                        "movie_official": " · Official"}.get(
-                                r.get("official_tier", ""), ""
-                            )
+                            # Playlists are checked by episode count, so they
+                            # get the source badge but no runtime chip.
+                            badge = _tier_badge(r.get("official_tier", ""))
                             st.markdown(
-                                f"**{_escape(r['title'])}**  \n"
-                                f"{_escape(r['channel'])} · {r.get('item_count')} episodes{audio_chip}{tier_tag}"
+                                f"{badge + chr(10) if badge else ''}**{_escape(r['title'])}**  \n"
+                                f"{_escape(r['channel'])} · {r.get('item_count')} episodes{audio_chip}",
+                                unsafe_allow_html=True,
                             )
                         with ycols[2]:
                             st.link_button(
@@ -2288,7 +3352,25 @@ def main():
             else:
                 st.subheader("Full Movie on YouTube")
                 if yt_results:
-                    st.caption(f"Trusted channels only — full-length, verified uploads.{lang_note}{auto_note} Pick one and play.")
+                    include_unofficial = st.session_state.get(
+                        "yt_include_unofficial", True
+                    )
+                    source_note = (
+                        "Any channel, each video badged by source."
+                        if include_unofficial
+                        else "Official broadcasters, studios and movie labels only."
+                    )
+                    runtime_note = (
+                        "lengths checked against OMDb's runtime"
+                        if omdb_status == "ready"
+                        else "lengths not cross-checked — OMDb has no runtime for this title"
+                    )
+                    st.caption(
+                        f"Full-length uploads ({runtime_note}) — {source_note}"
+                        f"{lang_note}{auto_note} Pick one and play."
+                    )
+                    if not _CHANNEL_AUDIT_ENFORCED:
+                        st.caption("Channel source is matched by name; the reviewed channel audit isn't applied yet.")
                     for r in yt_results:
                         ycols = st.columns([1, 3, 1])
                         with ycols[0]:
@@ -2304,14 +3386,12 @@ def main():
                         with ycols[1]:
                             al = r.get("audio_lang") or ""
                             aw = _LANG_BY_ISO.get(al, "") or al
-                            audio_chip = f" · {_escape(aw)} audio" if aw else ""
-                            tier_tag = {"tv": " · Official TV", "studio": " · Official",
-                                "movie_official": " · Official"}.get(
-                                r.get("official_tier", ""), ""
-                            )
+                            audio_chip = f" · {_escape(aw)} audio" if al else ""
                             st.markdown(
+                                f"{_trust_badges(r.get('official_tier', ''), r.get('runtime_verified'))}\n"
                                 f"**{_escape(r['title'])}**  \n"
-                                f"{_escape(r['channel'])} · {r['duration']} min{audio_chip}{tier_tag}"
+                                f"{_escape(r['channel'])} · {r['duration']} min{audio_chip}",
+                                unsafe_allow_html=True,
                             )
                         with ycols[2]:
                             st.link_button(
@@ -2321,17 +3401,30 @@ def main():
                                 type="primary",
                             )
                 else:
-                    if omdb_status != "ready":
-                        st.warning(
-                            "YouTube verification is unavailable because OMDb runtime data could not be loaded. "
-                            "Configure OMDB_API_KEY and select the title again."
+                    # OMDb being unusable no longer stops the search, so the
+                    # only reason for an empty list is a genuine API failure or
+                    # nothing qualifying. Surface both accurately.
+                    if (yt_status := st.session_state.get("yt_status", "")) in _YT_FAILURE_STATES:
+                        st.warning(_yt_status_message(yt_status))
+                    elif omdb_status != "ready":
+                        st.info(
+                            f"No full movie found on YouTube. {_omdb_status_message(omdb_status)}"
                         )
                     else:
                         st.info(
                             f"No {lang_name.title()} version found on YouTube right now."
                             if lang_name
-                            else "No trusted & verified full movie for this title on YouTube right now."
+                            else (
+                                "No full movie found on YouTube, official channels only — "
+                                "switch on \"Include uploads from unverified channels\" to "
+                                "search all channels."
+                                if not st.session_state.get("yt_include_unofficial", True)
+                                else "No full movie found on YouTube, even across "
+                                "unverified channels."
+                            )
                         )
+                    if omdb_error and omdb_status != "ready":
+                        st.caption(f"OMDb reported: {omdb_error}")
 
         st.divider()
         st.subheader("Watch for Free")

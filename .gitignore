@@ -5,3 +5,8 @@ __pycache__/
 *.pyc
 *.log
 .DS_Store
+
+# Local backups. app.py.bak predates the switch to environment secrets and still
+# has an OMDb key hardcoded as a fallback default, so it must never be committed.
+app.py.bak
+backups/
