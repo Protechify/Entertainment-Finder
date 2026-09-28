@@ -672,24 +672,94 @@ class ChannelPolicyTests(unittest.TestCase):
         self.assertTrue(app._has_exact_title(results, "interstellar"))
         self.assertEqual(app._correction_candidates("", results), [])
 
-    def test_youtube_searches_stop_once_the_daily_cap_is_reached(self):
-        """Each lookup spends three search queries at 100 units each, so
-        retrying after YouTube reports the cap as spent only burns latency and
-        quota on requests that cannot succeed."""
+    def test_a_justwatch_id_is_looked_up_by_imdb_id_instead(self):
+        """JustWatch ids are tm…/tv… entry numbers OMDb cannot resolve, so its
+        rows are searched by name — and a name fails whenever the two catalogues
+        disagree on spelling. "Naan Sirithal" and "Naan Sirithaal" are the same
+        film, and only one of those spellings is in OMDb."""
+        row = {
+            "id": "tm852819", "media_type": "movie", "title": "Naan Sirithal",
+            "year": "2020", "poster": None, "link": "https://justwatch.com/in/movie/naan-sirithal",
+        }
+        bridge = {
+            "id": "tt11138290", "media_type": "movie", "title": "Naan Sirithaal",
+            "year": "2020", "poster": None, "link": "https://www.imdb.com/title/tt11138290/",
+        }
+        with patch.object(app, "_resolve_by_imdb", return_value=bridge) as bridge_call, \
+                patch.object(app, "_omdb_fetch", return_value=({}, "Movie not found!")) as fetch:
+            def answer(params):
+                return ({"Title": "Naan Sirithaal", "Year": "2020", "Response": True}, "") \
+                    if params.get("i") == "tt11138290" else ({}, "Movie not found!")
+            fetch.side_effect = answer
+            details, error = app.omdb_details(row)
+
+        self.assertEqual(details.get("Title"), "Naan Sirithaal")
+        self.assertEqual(error, "")
+        bridge_call.assert_called_once()
+        # The row is corrected in place so the heading and the link agree with
+        # the record that was actually found.
+        self.assertEqual(row["id"], "tt11138290")
+        self.assertEqual(row["title"], "Naan Sirithaal")
+        self.assertIn("imdb.com/title/tt11138290", row["link"])
+
+    def test_a_title_already_holding_an_imdb_id_never_asks_the_bridge(self):
+        """The common case must not pay for an extra lookup: an OMDb row already
+        carries a tt… id and resolves on the first request."""
+        row = {"id": "tt0417241", "media_type": "movie", "title": "Villain", "year": "2002", "poster": None, "link": ""}
+        with patch.object(app, "_resolve_by_imdb") as bridge_call, \
+                patch.object(app, "_omdb_fetch", return_value=({"Title": "Villain", "Response": True}, "")) as fetch:
+            app.omdb_details(row)
+        bridge_call.assert_not_called()
+        self.assertEqual(fetch.call_args.args[0]["i"], "tt0417241")
+
+    def test_a_genuine_miss_is_reported_without_a_bridged_title(self):
+        """When the bridge agrees on nothing, the row keeps its own id and year.
+        Inventing an identity here is what would put an unrelated film's plot
+        under the title the user searched for."""
+        row = {"id": "tm999999", "media_type": "movie", "title": "Zzzqqq", "year": "1999", "poster": None, "link": ""}
+        with patch.object(app, "_resolve_by_imdb", return_value=None), \
+                patch.object(app, "_omdb_fetch", return_value=({}, "Movie not found!")):
+            details, error = app.omdb_details(row)
+        self.assertEqual(details, {})
+        self.assertEqual(error, "Movie not found!")
+        self.assertEqual(row["id"], "tm999999")
+
+    def test_cached_youtube_results_survive_the_quota_latch(self):
+        """The latch guards the search, not the cache. A title already looked
+        up today is still in the six-hour cache, and reporting it as unchecked
+        would state the opposite of what the app knows."""
         self.addCleanup(setattr, app, "_YT_QUOTA_SPENT", False)
-
         app._YT_QUOTA_SPENT = True
-        with patch.object(app, "_youtube_full_movie_cached") as cached:
-            self.assertEqual(app.youtube_full_movie("Villain", "2002", "movie"), [])
-        cached.assert_not_called()
+        cached = [{"video_id": "abc", "title": "Villain (2002)"}]
+        with patch.object(app, "_youtube_full_movie_cached", return_value=cached):
+            self.assertEqual(app.youtube_full_movie("Villain", "2002", "movie"), cached)
 
-    def test_the_quota_message_names_the_limit_it_hit(self):
-        """'API quota is exhausted' reads as if every YouTube feature is dead.
-        Only the search metric is capped, and the cost is worth stating so the
-        cap is not mistaken for a bug."""
+    def test_the_quota_latch_stops_the_search_itself(self):
+        """A title that has never been looked up is refused before any request
+        is made, so the three search queries a lookup costs are not spent on a
+        request that can only fail."""
+        self.addCleanup(setattr, app, "_YT_QUOTA_SPENT", False)
+        app._YT_QUOTA_SPENT = True
+        undecorated = app._youtube_full_movie_cached.__wrapped__
+        with self.assertRaises(app._YouTubeSearchError) as caught:
+            undecorated("Villain", "2002", "movie", "", 0, False, "", False, "")
+        self.assertEqual(caught.exception.status, "quota")
+
+    def test_the_quota_message_says_the_title_was_not_checked(self):
+        """A limit on YouTube's API must not read as a film being unavailable,
+        and the message has to say plainly that nothing was looked up."""
         message = app._yt_status_message("quota")
-        self.assertIn("search quota", message)
-        self.assertIn("100 units", message)
+        self.assertIn("exceeded", message)
+        self.assertIn("not checked", message)
+
+    def test_not_saying_a_trusted_movie_exists_when_none_was_found(self):
+        """The empty list means the trusted channels had nothing qualifying,
+        which is a different claim from never having searched."""
+        self.assertIn("trusted", app._yt_not_found_message())
+        self.assertIn("trusted", app._yt_not_found_message("tamil"))
+        self.assertIn("trusted", app._yt_not_found_message("", official_only=True))
+        # The hint for widening the search must survive the rewording.
+        self.assertIn("Include uploads from unverified channels", app._yt_not_found_message("", True))
 
     def test_generic_channel_words_do_not_earn_a_trust_badge(self):
         """'&TV' reduces to the single token 'tv', so the subset match badged any

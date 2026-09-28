@@ -997,23 +997,45 @@ def omdb_details(selected: dict) -> tuple[dict, str]:
         selected["year"] = found["year"] or selected.get("year") or ""
         selected["title"] = found["title"]
         selected["link"] = found["link"]
-    params = {
+    # One record per lookup, whichever way the title is addressed. JustWatch
+    # hands back tm…/tv… entry numbers that OMDb cannot resolve, so its rows are
+    # asked for by name, and a name only works when both catalogues spell it the
+    # same way. IMDb holds the record under its own id and tolerates either
+    # spelling, so a name that comes back empty is retried by id.
+    base = {
         "apikey": OMDB_API_KEY,
         "plot": "full",
+        "type": "series" if selected["media_type"] == "tv" else "movie",
     }
-    if selected["media_type"] == "tv":
-        params["type"] = "series"
-    else:
-        params["type"] = "movie"
     imdb_id = selected.get("id") or ""
     if imdb_id.startswith("tt"):
-        params["i"] = imdb_id
+        details, error = _omdb_fetch({**base, "i": imdb_id})
     else:
-        params["t"] = selected["title"].strip()
+        by_name = {**base, "t": selected["title"].strip()}
         year = str(selected.get("year") or "").strip()
         if year.isdigit():
-            params["y"] = year
-    details, error = _omdb_fetch(params)
+            by_name["y"] = year
+        details, error = _omdb_fetch(by_name)
+        if not details:
+            # "Naan Sirithal" is how JustWatch spells it and "Naan Sirithaal"
+            # how OMDb spells it, so the film vanishes on a transliteration the
+            # user never sees. Ask IMDb which film this is instead: it holds the
+            # record under its own id and matches on either spelling. The
+            # bridge requires a year and a close-enough title, so the result
+            # cannot wander onto an unrelated release the way a bare name
+            # lookup can.
+            found = _resolve_by_imdb(
+                selected.get("title") or "", year,
+                selected.get("media_type") or "",
+            )
+            if found:
+                selected["id"] = found["id"]
+                selected["link"] = found["link"]
+                if found.get("title"):
+                    selected["title"] = found["title"]
+                if found.get("year"):
+                    selected["year"] = found["year"]
+                details, error = _omdb_fetch({**base, "i": found["id"]})
     if details and not selected.get("poster"):
         # The resolved record carries the poster the missing catalogue row had
         # no way of supplying.
@@ -1338,6 +1360,14 @@ def _youtube_full_movie_cached(
 
     def _collect(query: str, use_language: bool) -> list:
         nonlocal query_status, successful_queries
+        if _YT_QUOTA_SPENT:
+            # Reached only on a cache miss, which is what makes it safe: a title
+            # already looked up today is served from the six-hour cache for
+            # nothing, and only a title that has never been searched is refused
+            # here. Raising skips the remaining rounds, so nothing is spent on
+            # requests that cannot succeed, and the failure is not cached — the
+            # next lookup after the reset searches again.
+            raise _YouTubeSearchError("quota")
         if not query.strip():
             return []
         params = {
@@ -1564,15 +1594,6 @@ def youtube_full_movie(
     audit_version: str = "", include_unofficial: bool = False,
     search_epoch: str = "",
 ) -> list:
-    # Once YouTube's daily search cap is reached, every later lookup is a
-    # guaranteed 429, and each attempt would still cost the three search
-    # queries this runs. Latching the failure means browsing titles stays
-    # responsive and the quota that is left is not spent on requests that
-    # cannot succeed. The latch is per-process, so a restart picks YouTube
-    # back up as soon as the counter resets.
-    if _YT_QUOTA_SPENT:
-        st.session_state["yt_status"] = "quota"
-        return []
     try:
         results = _youtube_full_movie_cached(
             title,
@@ -1599,11 +1620,8 @@ def youtube_full_movie(
 # act on.
 _YT_STATUS_MESSAGES = {
     "quota": (
-        "YouTube's daily search quota is used up, so no full-movie results "
-        "could be looked up. The rest of the app is unaffected — this is a "
-        "limit on YouTube's search API, which costs 100 units per query "
-        "(3 per title here, so roughly 30 titles a day). It resets at "
-        "midnight Pacific time."
+        "YouTube's daily search quota is exceeded, so this title was not "
+        "checked. It resets at midnight Pacific time."
     ),
     "auth": (
         "YouTube rejected the API key, so full-movie results couldn't be checked. "
@@ -1624,6 +1642,27 @@ _YT_FAILURE_STATES = frozenset(_YT_STATUS_MESSAGES)
 
 def _yt_status_message(status: str) -> str:
     return _YT_STATUS_MESSAGES.get(status, "")
+
+
+def _yt_not_found_message(lang_name: str = "", official_only: bool = False) -> str:
+    """Say a title has no trusted full movie on YouTube, and why.
+
+    "Not found" here means the trusted-channel list came back empty, which is a
+    different statement from a title that simply has not been looked up — an
+    exhausted quota and a missing film must never read the same, or a limit on
+    YouTube's API gets reported as a film being unavailable. So the search
+    failure is reported by `_yt_status_message` instead, and this copy is only
+    reached when YouTube was actually asked and had nothing qualifying.
+    """
+    if lang_name:
+        return f"No trusted {lang_name.title()} full movie found on YouTube right now."
+    if official_only:
+        return (
+            "No trusted full movie found on YouTube — only official broadcaster, "
+            "studio and movie-label channels were checked. Switch on \"Include "
+            "uploads from unverified channels\" to search all channels."
+        )
+    return "No trusted full movie found on YouTube, even across unverified channels."
 
 
 youtube_full_movie.clear = _youtube_full_movie_cached.clear
@@ -3402,27 +3441,21 @@ def main():
                             )
                 else:
                     # OMDb being unusable no longer stops the search, so the
-                    # only reason for an empty list is a genuine API failure or
-                    # nothing qualifying. Surface both accurately.
+                    # only reasons for an empty list are a genuine API failure
+                    # or nothing qualifying. Those are different facts about the
+                    # film, so they are reported differently.
                     if (yt_status := st.session_state.get("yt_status", "")) in _YT_FAILURE_STATES:
                         st.warning(_yt_status_message(yt_status))
-                    elif omdb_status != "ready":
-                        st.info(
-                            f"No full movie found on YouTube. {_omdb_status_message(omdb_status)}"
-                        )
                     else:
-                        st.info(
-                            f"No {lang_name.title()} version found on YouTube right now."
-                            if lang_name
-                            else (
-                                "No full movie found on YouTube, official channels only — "
-                                "switch on \"Include uploads from unverified channels\" to "
-                                "search all channels."
-                                if not st.session_state.get("yt_include_unofficial", True)
-                                else "No full movie found on YouTube, even across "
-                                "unverified channels."
-                            )
+                        not_found = _yt_not_found_message(
+                            lang_name, not st.session_state.get("yt_include_unofficial", True)
                         )
+                        # With no OMDb record there is no runtime to check video
+                        # lengths against, which is a second thing the user
+                        # cannot otherwise tell apart from a missing film.
+                        if omdb_status != "ready":
+                            not_found = f"{not_found} {_omdb_status_message(omdb_status)}"
+                        st.info(not_found)
                     if omdb_error and omdb_status != "ready":
                         st.caption(f"OMDb reported: {omdb_error}")
 
