@@ -1375,7 +1375,7 @@ def _youtube_full_movie_cached(
             "q": query.strip(),
             "type": "video",
             "videoEmbeddable": "true",
-            "maxResults": 50,
+            "maxResults": 3,
             "key": YOUTUBE_API_KEY,
         }
         if use_language and marker:
@@ -2098,7 +2098,7 @@ def youtube_series_episodes(
             "q": query.strip(),
             "type": "video",
             "videoEmbeddable": "true",
-            "maxResults": 50,
+            "maxResults": 3,
             "key": YOUTUBE_API_KEY,
         }
         if marker:
